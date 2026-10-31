@@ -1,5 +1,3 @@
-cat >> .gitignore <<'EOF'
-
 # Secrets and environment files
 .env
 .env.*
@@ -8,13 +6,21 @@ cat >> .gitignore <<'EOF'
 **/.env.*
 !**/.env.example
 
-# Generated files and dependencies
+# Generated files, databases and workspace storage
 .DS_Store
 __pycache__/
 *.py[cod]
 *.db
+backend/ledger.db
+backend/data/
+data/
+workspaces/
+
+# Dependencies and build artifacts
 node_modules/
 dist/
+build/
 .venv/
 venv/
-EOF
+.pytest_cache/
+.mypy_cache/

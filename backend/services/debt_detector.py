@@ -63,10 +63,13 @@ class DebtReport(BaseModel):
 
 class GraphPayload(BaseModel):
     workspace_id: str | None = None
+    repo_root: str | None = None
     nodes: list[dict[str, Any]] = Field(default_factory=list)
     edges: list[dict[str, Any]] = Field(default_factory=list)
     files: list[str] = Field(default_factory=list)
     file_map: dict[str, str] = Field(default_factory=dict)
+    validation_summary: dict[str, Any] | None = None
+    git_info: dict[str, Any] | None = None
 
 
 # =====================================================================

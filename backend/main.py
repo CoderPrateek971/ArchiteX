@@ -8,9 +8,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # Keep your AI services imports
+from services.architecture_explainer import (
+    ArchitectureReport,
+    AskCodebaseRequest,
+    CodebaseQnAResponse,
+    OnboardingDocResponse,
+    analyze_codebase_architecture,
+    answer_codebase_question,
+    generate_onboarding_documentation,
+)
 from services.ast_parser import ingest_zip
 from services.debt_detector import DebtReport, GraphPayload, analyze_debt
 from services.llm_router import generate_completion
+from services.workspace_manager import (
+    cleanup_workspace,
+    create_workspace_from_git,
+    create_workspace_from_zip,
+    read_workspace_file,
+)
 
 app = FastAPI(title="ArchiteX API", version="0.1.0")
 
@@ -66,6 +81,10 @@ class RollbackRequest(BaseModel):
     id: int
     workspace_root: Optional[str] = None
 
+class GitCloneRequest(BaseModel):
+    url: str = Field(..., min_length=1, description="URL of the Git repository to clone")
+    branch: Optional[str] = Field(None, description="Optional branch or tag name")
+
 # --- 3. Core AI Endpoints ---
 @app.get("/health")
 def health() -> dict:
@@ -83,16 +102,47 @@ def generate(request: PromptRequest) -> PromptResponse:
 async def upload_repo(file: UploadFile = File(...)) -> dict:
     filename = (file.filename or "").lower()
     if not filename.endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Upload a .zip file.")
+        raise HTTPException(status_code=400, detail="Please upload a .zip file.")
 
     zip_bytes = await file.read()
     if not zip_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded zip is empty.")
+        raise HTTPException(status_code=400, detail="Uploaded zip file is empty.")
 
     try:
-        return ingest_zip(zip_bytes)
+        return create_workspace_from_zip(zip_bytes, filename=file.filename or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to parse repository: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"Failed to ingest ZIP repository: {exc}") from exc
+
+@app.post("/api/clone-repo")
+def clone_repo(request: GitCloneRequest) -> dict:
+    try:
+        return create_workspace_from_git(git_url=request.url, branch=request.branch)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to clone and ingest Git repository: {exc}") from exc
+
+@app.get("/api/workspace/{workspace_id}/file")
+def get_workspace_file_content(workspace_id: str, path: str) -> dict:
+    try:
+        content = read_workspace_file(workspace_id, path)
+        return {"path": path, "content": content}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+@app.delete("/api/workspace/{workspace_id}")
+def delete_workspace(workspace_id: str) -> dict:
+    try:
+        cleanup_workspace(workspace_id)
+        return {"status": "ok", "message": f"Workspace {workspace_id} removed"}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 @app.post("/api/analyze-debt", response_model=DebtReport)
 def analyze_repo_debt(graph: GraphPayload) -> DebtReport:
@@ -100,6 +150,27 @@ def analyze_repo_debt(graph: GraphPayload) -> DebtReport:
         return analyze_debt(graph)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Debt analysis failed: {exc}") from exc
+
+@app.post("/api/explain-architecture", response_model=ArchitectureReport)
+def explain_architecture_endpoint(graph: GraphPayload) -> ArchitectureReport:
+    try:
+        return analyze_codebase_architecture(graph)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Architecture explanation failed: {exc}") from exc
+
+@app.post("/api/generate-onboarding", response_model=OnboardingDocResponse)
+def generate_onboarding_endpoint(graph: GraphPayload) -> OnboardingDocResponse:
+    try:
+        return generate_onboarding_documentation(graph)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Onboarding generation failed: {exc}") from exc
+
+@app.post("/api/ask-codebase", response_model=CodebaseQnAResponse)
+def ask_codebase_endpoint(request: AskCodebaseRequest) -> CodebaseQnAResponse:
+    try:
+        return answer_codebase_question(request.graph, request.question)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Codebase Q&A failed: {exc}") from exc
 
 # --- 4. Ledger & Physical File Modification Endpoints ---
 @app.get("/api/ledger")
