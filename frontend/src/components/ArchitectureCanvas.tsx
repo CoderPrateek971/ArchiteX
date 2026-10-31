@@ -28,9 +28,10 @@ type Props = {
   graphNodes: GraphNode[];
   graphEdges: GraphEdge[];
   selectedPath: string | null;
+  onSelectNode?: (node: GraphNode | null) => void;
 };
 
-function FlowCanvas({ graphNodes, graphEdges, selectedPath }: Props) {
+function FlowCanvas({ graphNodes, graphEdges, selectedPath, onSelectNode }: Props) {
   const mappedNodes = useMemo<Node[]>(
     () =>
       graphNodes.map((node) => ({
@@ -52,18 +53,35 @@ function FlowCanvas({ graphNodes, graphEdges, selectedPath }: Props) {
   const mappedEdges = useMemo<Edge[]>(
     () =>
       graphEdges.map((edge) => {
-        const kind = edge.data?.kind || "related";
-        const isImport = kind === "import";
+        const kind = String(edge.data?.kind || edge.label || "related").toLowerCase();
+        const isImport = kind.includes("import");
+        const isCall = kind.includes("call");
+        const isInherits = kind.includes("inherit");
+
+        let strokeColor = "#475569";
+        let arrowColor = "#64748b";
+
+        if (isImport) {
+          strokeColor = "#22d3ee";
+          arrowColor = "#22d3ee";
+        } else if (isCall) {
+          strokeColor = "#34d399";
+          arrowColor = "#34d399";
+        } else if (isInherits) {
+          strokeColor = "#a78bfa";
+          arrowColor = "#a78bfa";
+        }
+
         return {
           ...edge,
-          animated: isImport,
+          animated: isImport || isCall,
           markerEnd: {
             type: MarkerType.ArrowClosed,
-            color: isImport ? "#22d3ee" : "#64748b",
+            color: arrowColor,
           },
           style: {
-            stroke: isImport ? "#22d3ee" : "#475569",
-            strokeWidth: isImport ? 1.6 : 1.2,
+            stroke: strokeColor,
+            strokeWidth: isImport || isCall || isInherits ? 1.6 : 1.2,
           },
           labelStyle: { fill: "#94a3b8", fontSize: 10, fontFamily: "var(--font-mono)" },
           labelBgStyle: { fill: "#07090e", fillOpacity: 0.85 },
@@ -90,6 +108,8 @@ function FlowCanvas({ graphNodes, graphEdges, selectedPath }: Props) {
       onNodesChange={onNodesChange}
       onEdgesChange={onEdgesChange}
       nodeTypes={nodeTypes}
+      onNodeClick={(_, node) => onSelectNode?.(node as unknown as GraphNode)}
+      onPaneClick={() => onSelectNode?.(null)}
       fitView
       fitViewOptions={{ padding: 0.2 }}
       minZoom={0.2}
