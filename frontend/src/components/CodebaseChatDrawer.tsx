@@ -1,16 +1,18 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   MessageSquare,
   Send,
   Loader2,
   X,
   FileCode,
-  Box,
   Sparkles,
   HelpCircle,
+  Key,
+  Check,
 } from "lucide-react";
-import { askCodebase, errorMessage } from "../lib/api";
+import { askCodebase, errorMessage, getLLMStatus, setGeminiApiKey, type LLMStatus } from "../lib/api";
 import type { CodebaseQnAResponse, GraphPayload } from "../lib/types";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 
 type Props = {
   open: boolean;
@@ -38,6 +40,50 @@ export default function CodebaseChatDrawer({
   const [history, setHistory] = useState<QAItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Gemini API Key state
+  const [llmStatus, setLlmStatus] = useState<LLMStatus | null>(null);
+  const [showKeyInput, setShowKeyInput] = useState(false);
+  const [keyInput, setKeyInput] = useState("");
+  const [savingKey, setSavingKey] = useState(false);
+  const [saveSuccess, setSaveSuccess] = useState(false);
+
+  useEffect(() => {
+    if (open) {
+      void fetchStatus();
+    }
+  }, [open]);
+
+  const fetchStatus = async () => {
+    try {
+      const status = await getLLMStatus();
+      setLlmStatus(status);
+    } catch {
+      // Backend might be offline or initializing
+    }
+  };
+
+  const handleSaveKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!keyInput.trim()) return;
+
+    setSavingKey(true);
+    setError(null);
+    try {
+      const updated = await setGeminiApiKey(keyInput.trim());
+      setLlmStatus(updated);
+      setSaveSuccess(true);
+      setKeyInput("");
+      setTimeout(() => {
+        setSaveSuccess(false);
+        setShowKeyInput(false);
+      }, 1500);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSavingKey(false);
+    }
+  };
 
   if (!open) return null;
 
@@ -69,7 +115,26 @@ export default function CodebaseChatDrawer({
               <MessageSquare size={18} />
             </span>
             <div>
-              <h3 className="drawer-title">Codebase Intelligence Q&A</h3>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <h3 className="drawer-title">Codebase Intelligence Q&A</h3>
+                {llmStatus?.has_gemini_key ? (
+                  <span
+                    className="llm-pill connected"
+                    title={`Connected via ${llmStatus.primary_model}`}
+                  >
+                    <Sparkles size={10} /> Gemini Active
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    className="llm-pill warning"
+                    onClick={() => setShowKeyInput(!showKeyInput)}
+                    title="Click to connect Gemini API Key"
+                  >
+                    <Key size={10} /> Connect Gemini
+                  </button>
+                )}
+              </div>
               <p className="drawer-subtitle">Ask questions about architecture, files, symbols, and data flow</p>
             </div>
           </div>
@@ -82,6 +147,52 @@ export default function CodebaseChatDrawer({
             <X size={18} />
           </button>
         </div>
+
+        {/* Gemini Key Config Accordion */}
+        {showKeyInput && (
+          <form className="gemini-key-box" onSubmit={handleSaveKey}>
+            <div className="gemini-key-header">
+              <span className="gemini-key-title">
+                <Key size={13} className="text-cyan" /> Configure Gemini API Key
+              </span>
+              <button
+                type="button"
+                className="gemini-key-close"
+                onClick={() => setShowKeyInput(false)}
+              >
+                ✕
+              </button>
+            </div>
+            <div className="gemini-key-input-row">
+              <input
+                type="password"
+                className="gemini-key-input"
+                placeholder="Paste your Gemini API key (starts with AIza...)"
+                value={keyInput}
+                onChange={(e) => setKeyInput(e.target.value)}
+                autoFocus
+              />
+              <button
+                type="submit"
+                className="gemini-key-btn"
+                disabled={savingKey || !keyInput.trim()}
+              >
+                {savingKey ? (
+                  <Loader2 size={13} className="animate-spin" />
+                ) : saveSuccess ? (
+                  <>
+                    <Check size={13} /> Connected!
+                  </>
+                ) : (
+                  "Connect"
+                )}
+              </button>
+            </div>
+            <p className="gemini-key-hint">
+              Saved securely to <code>backend/.env</code> as <code>GEMINI_API_KEY</code> and activates Gemini 1.5 Flash for your chatbot.
+            </p>
+          </form>
+        )}
 
         {/* Quick Suggestion Chips */}
         <div className="quick-prompts-bar">
@@ -112,7 +223,7 @@ export default function CodebaseChatDrawer({
               <MessageSquare size={32} className="text-muted" />
               <p className="empty-title">Ask anything about this project</p>
               <p className="empty-subtitle">
-                ArchiteX uses the AST dependency graph to explain how components interact, locate responsibilities, and trace execution pipelines.
+                ArchiteX uses Gemini and the AST dependency graph to explain how components interact, locate responsibilities, and trace execution pipelines.
               </p>
             </div>
           )}
@@ -120,7 +231,7 @@ export default function CodebaseChatDrawer({
           {loading && (
             <div className="chat-loading-item">
               <Loader2 size={20} className="animate-spin text-cyan" />
-              <span>Analyzing AST knowledge graph & source definitions…</span>
+              <span>Analyzing AST knowledge graph & querying Gemini…</span>
             </div>
           )}
 
@@ -141,7 +252,7 @@ export default function CodebaseChatDrawer({
                   )}
                 </div>
                 <div className="qa-answer-body">
-                  <pre className="qa-answer-text">{item.answer}</pre>
+                  <MarkdownRenderer content={item.answer} compact />
                 </div>
 
                 {item.relevant_files.length > 0 && (
@@ -199,4 +310,3 @@ export default function CodebaseChatDrawer({
     </div>
   );
 }
-

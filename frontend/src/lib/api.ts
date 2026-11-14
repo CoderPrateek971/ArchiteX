@@ -91,3 +91,22 @@ export async function askCodebase(question: string, graph: GraphPayload): Promis
   });
   return data;
 }
+
+export type LLMStatus = {
+  connected: boolean;
+  primary_model: string;
+  fallback_model: string;
+  has_gemini_key: boolean;
+  has_openai_key: boolean;
+  active_provider: "gemini" | "openai" | "none";
+};
+
+export async function getLLMStatus(): Promise<LLMStatus> {
+  const { data } = await api.get<LLMStatus>("/api/llm/status");
+  return data;
+}
+
+export async function setGeminiApiKey(apiKey: string): Promise<LLMStatus> {
+  const { data } = await api.post<LLMStatus>("/api/llm/gemini-key", { api_key: apiKey.trim() });
+  return data;
+}
