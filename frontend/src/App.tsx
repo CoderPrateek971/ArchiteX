@@ -8,10 +8,13 @@ import {
   Upload,
   Workflow,
   FileCode,
+  AlertCircle,
+  Cpu,
 } from "lucide-react";
 
 import ArchitectureCanvas from "./components/ArchitectureCanvas";
 import LedgerPanel from "./components/LedgerPanel";
+import ModelRouterModal from "./components/ModelRouterModal";
 import ResolutionView from "./components/ResolutionView";
 import { analyzeDebt, errorMessage, logLedgerChange, uploadRepo } from "./lib/api";
 import type { DebtFinding, GraphPayload, Severity } from "./lib/types";
@@ -28,6 +31,7 @@ export default function App() {
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [activeFinding, setActiveFinding] = useState<DebtFinding | null>(null);
   const [ledgerOpen, setLedgerOpen] = useState(false);
+  const [routerOpen, setRouterOpen] = useState(false);
   const [ledgerRefresh, setLedgerRefresh] = useState(0);
   const [uploading, setUploading] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
@@ -138,15 +142,26 @@ export default function App() {
               <p className="brand-subtitle">AI Architecture Intelligence</p>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={() => setLedgerOpen(true)}
-            className="header-action-btn"
-            title="Open Smart Ledger History"
-            aria-label="Open history ledger"
-          >
-            <History size={18} />
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <button
+              type="button"
+              onClick={() => setRouterOpen(true)}
+              className="header-action-btn"
+              title="Multi-Model AI Router Hub & Arena"
+              aria-label="Open AI Router Hub"
+            >
+              <Cpu size={18} />
+            </button>
+            <button
+              type="button"
+              onClick={() => setLedgerOpen(true)}
+              className="header-action-btn"
+              title="Open Smart Ledger History"
+              aria-label="Open history ledger"
+            >
+              <History size={18} />
+            </button>
+          </div>
         </div>
 
         {/* Upload Zone */}
@@ -262,15 +277,53 @@ export default function App() {
                       {finding.line_number && (
                         <span className="card-line">L{finding.line_number}</span>
                       )}
+                      {finding.category && (
+                        <span className={`category-pill ${finding.category.toLowerCase().replace(/\s+/g, "-")}`}>
+                          {finding.category}
+                        </span>
+                      )}
                     </div>
                     <span className={`severity-pill ${finding.severity}`}>
                       {finding.severity}
                     </span>
                   </div>
 
+                  {finding.title && <div className="card-title-text">{finding.title}</div>}
+
                   <p className="card-desc">
                     {finding.description || finding.title}
                   </p>
+
+                  {finding.root_cause && (
+                    <div className="card-root-cause">
+                      <span className="root-cause-label">ROOT CAUSE:</span> {finding.root_cause}
+                    </div>
+                  )}
+
+                  {finding.code_evidence && (
+                    <div className="card-code-evidence">
+                      <pre><code>{finding.code_evidence}</code></pre>
+                    </div>
+                  )}
+
+                  {finding.potential_impact && (
+                    <div className="card-impact-callout">
+                      <AlertCircle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
+                      <span><strong>Impact:</strong> {finding.potential_impact}</span>
+                    </div>
+                  )}
+
+                  {finding.affected_files && finding.affected_files.length > 0 && (
+                    <div className="card-affected-files">
+                      <span className="affected-label">Affected ({finding.affected_files.length}):</span>
+                      {finding.affected_files.slice(0, 3).map((f) => (
+                        <span key={f} className="affected-pill">{f.split("/").pop()}</span>
+                      ))}
+                      {finding.affected_files.length > 3 && (
+                        <span className="affected-more">+{finding.affected_files.length - 3} more</span>
+                      )}
+                    </div>
+                  )}
 
                   <div className="card-action-box" onClick={(e) => e.stopPropagation()}>
                     {finding.severity === "Low" ? (
@@ -368,6 +421,12 @@ export default function App() {
           onClose={() => setLedgerOpen(false)}
           refreshKey={ledgerRefresh}
           workspaceRoot={graph?.repo_root}
+        />
+
+        {/* Multi-Model AI Router Hub */}
+        <ModelRouterModal
+          isOpen={routerOpen}
+          onClose={() => setRouterOpen(false)}
         />
       </main>
     </div>

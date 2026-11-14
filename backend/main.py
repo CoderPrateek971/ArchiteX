@@ -10,7 +10,24 @@ from pydantic import BaseModel, Field
 # Keep your AI services imports
 from services.ast_parser import ingest_zip
 from services.debt_detector import DebtReport, GraphPayload, analyze_debt
-from services.llm_router import generate_completion
+from services.repair_planner import (
+    GuidedRepairPlan,
+    TestValidationRequest,
+    TestValidationResult,
+    generate_guided_repair_plan,
+    validate_repair_with_tests,
+)
+from services.llm_router import (
+    ComparisonReport,
+    ModelProfile,
+    OptimizationStrategy,
+    RouterResponse,
+    TaskType,
+    compare_model_responses,
+    generate_completion,
+    get_model_profiles,
+    route_and_generate,
+)
 
 app = FastAPI(title="ArchiteX API", version="0.1.0")
 
@@ -53,6 +70,19 @@ class PromptResponse(BaseModel):
     model: str
     fallback_used: bool
 
+class RouterGenerateRequest(BaseModel):
+    prompt: str = Field(..., min_length=1)
+    system: Optional[str] = None
+    task_type: Optional[TaskType] = None
+    strategy: OptimizationStrategy = OptimizationStrategy.BALANCED
+    override_model: Optional[str] = None
+
+class RouterCompareRequest(BaseModel):
+    prompt: str = Field(..., min_length=1)
+    candidate_models: Optional[List[str]] = None
+    system: Optional[str] = None
+    strategy: OptimizationStrategy = OptimizationStrategy.BALANCED
+
 class LedgerLogRequest(BaseModel):
     file_path: str
     severity: str
@@ -79,6 +109,35 @@ def generate(request: PromptRequest) -> PromptResponse:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return PromptResponse(**result)
 
+@app.get("/api/router/models", response_model=List[ModelProfile])
+def list_router_models() -> List[ModelProfile]:
+    return get_model_profiles()
+
+@app.post("/api/router/generate", response_model=RouterResponse)
+def router_generate(req: RouterGenerateRequest) -> RouterResponse:
+    try:
+        return route_and_generate(
+            prompt=req.prompt,
+            system=req.system,
+            task_type=req.task_type,
+            strategy=req.strategy,
+            override_model=req.override_model,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Routing failed: {exc}") from exc
+
+@app.post("/api/router/compare", response_model=ComparisonReport)
+def router_compare(req: RouterCompareRequest) -> ComparisonReport:
+    try:
+        return compare_model_responses(
+            prompt=req.prompt,
+            candidate_models=req.candidate_models,
+            system=req.system,
+            strategy=req.strategy,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Model comparison failed: {exc}") from exc
+
 @app.post("/api/upload-repo")
 async def upload_repo(file: UploadFile = File(...)) -> dict:
     filename = (file.filename or "").lower()
@@ -100,6 +159,13 @@ def analyze_repo_debt(graph: GraphPayload) -> DebtReport:
         return analyze_debt(graph)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Debt analysis failed: {exc}") from exc
+
+@app.post("/api/repair/validate-tests", response_model=TestValidationResult)
+def validate_repair_tests(request: TestValidationRequest) -> TestValidationResult:
+    try:
+        return validate_repair_with_tests(request)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Validation failed: {exc}") from exc
 
 # --- 4. Ledger & Physical File Modification Endpoints ---
 @app.get("/api/ledger")
