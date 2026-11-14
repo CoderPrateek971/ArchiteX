@@ -8,6 +8,8 @@ import {
   Upload,
   Workflow,
   FileCode,
+  AlertCircle,
+  Cpu,
   GitBranch,
   Globe,
   RotateCcw,
@@ -22,6 +24,7 @@ import ArchitectureCanvas from "./components/ArchitectureCanvas";
 import ArchitectureView from "./components/ArchitectureView";
 import CodebaseChatDrawer from "./components/CodebaseChatDrawer";
 import LedgerPanel from "./components/LedgerPanel";
+import ModelRouterModal from "./components/ModelRouterModal";
 import OnboardingModal from "./components/OnboardingModal";
 import ResolutionView from "./components/ResolutionView";
 import {
@@ -59,6 +62,7 @@ export default function App() {
   const [activeFinding, setActiveFinding] = useState<DebtFinding | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [ledgerOpen, setLedgerOpen] = useState(false);
+  const [routerOpen, setRouterOpen] = useState(false);
   const [ledgerRefresh, setLedgerRefresh] = useState(0);
   const [uploading, setUploading] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
@@ -291,6 +295,16 @@ export default function App() {
               <p className="brand-subtitle">AI Architecture Intelligence</p>
             </div>
           </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <button
+              type="button"
+              onClick={() => setRouterOpen(true)}
+              className="header-action-btn"
+              title="Multi-Model AI Router Hub & Arena"
+              aria-label="Open AI Router Hub"
+            >
+              <Cpu size={18} />
+            </button>
           <div className="header-actions">
             {graph && (
               <>
@@ -330,7 +344,7 @@ export default function App() {
               title="Open Smart Ledger History"
               aria-label="Open history ledger"
             >
-              <History size={16} />
+              <History size={18} />
             </button>
           </div>
         </div>
@@ -593,57 +607,118 @@ export default function App() {
               </div>
             )}
 
-            {/* Findings List */}
-            <div className="findings-scroll">
-              {visibleFindings.length === 0 && !uploading && !analyzing && (
-                <div className="empty-state">
-                  <ShieldAlert size={28} className="empty-icon" />
-                  <p className="empty-title">No {tab.toLowerCase()} severity issues</p>
-                  <p className="empty-subtitle">
-                    {findings.length > 0 ? "Switch tabs to view other detected debt." : "Repository healthy or no repo ingested."}
+<div className="findings-scroll">
+  {visibleFindings.length === 0 && !uploading && !analyzing && (
+    <div className="empty-state">
+      <ShieldAlert size={28} className="empty-icon" />
+      <p className="empty-title">
+        No {tab.toLowerCase()} severity issues
+      </p>
+      <p className="empty-subtitle">
+        {findings.length > 0
+          ? "Switch tabs to view other detected debt."
+          : "Repository healthy or no repo ingested."}
+      </p>
+    </div>
+  )}
+
+  {visibleFindings.map((finding, idx) => {
+    const cleanPath = finding.file_name.replace(/^file:/, "");
+    const isSelected = selectedPath === finding.file_name;
+    const findingKey = `${finding.file_name}-${finding.line_number ?? idx}`;
+    const isSolvingThis = autoSolvingId === findingKey;
+    const isLow = finding.severity === "Low";
+
+    return (
+      <div
+        key={findingKey}
+        className={`debt-card ${isSelected ? "selected" : ""}`}
+        onClick={() => {
+          setSelectedPath(finding.file_name);
+
+          if (!isLow) {
+            setActiveFinding(finding);
+          } else {
+            setActiveFinding(null);
+          }
+        }}
+      >
+        <div className="card-header">
+          <div className="card-title-group">
+            <FileCode size={13} color="var(--cyan-400)" />
+
+            <span className="card-file" title={cleanPath}>
+              {cleanPath}
+            </span>
+
+            {finding.line_number && (
+              <span className="card-line">
+                L{finding.line_number}
+              </span>
+            )}
+
+            {finding.category && (
+              <span
+                className={`category-pill ${finding.category
+                  .toLowerCase()
+                  .replace(/\s+/g, "-")}`}
+              >
+                {finding.category}
+              </span>
+            )}
+          </div>
+
+          <span
+            className={`severity-badge badge-${finding.severity.toLowerCase()}`}
+          >
+            {finding.severity}
+          </span>
+        </div>
+
+                  {finding.title && <div className="card-title-text">{finding.title}</div>}
+
+                  <p className="card-desc">
+                    {finding.description || finding.title}
                   </p>
-                </div>
-              )}
 
-              {visibleFindings.map((finding, idx) => {
-                const isSelected = selectedPath === finding.file_name;
-                const isAutoSolving = autoSolvingId === `${finding.file_name}-${finding.line_number ?? 0}`;
-                const isLow = finding.severity === "Low";
-
-                return (
-                  <div
-                    key={`${finding.file_name}-${idx}`}
-                    className={`finding-card finding-${finding.severity.toLowerCase()} ${
-                      isSelected ? "selected" : ""
-                    }`}
-                    onClick={() => {
-                      setSelectedPath(finding.file_name);
-                      if (!isLow) setActiveFinding(finding);
-                    }}
-                  >
-                    <div className="finding-header">
-                      <p className="finding-file" title={finding.file_name}>
-                        <FileCode size={13} style={{ flexShrink: 0 }} />
-                        <span>{finding.file_name}</span>
-                        {finding.line_number && (
-                          <span className="finding-line">:{finding.line_number}</span>
-                        )}
-                      </p>
-                      <span className={`severity-badge badge-${finding.severity.toLowerCase()}`}>
-                        {finding.severity}
-                      </span>
+                  {finding.root_cause && (
+                    <div className="card-root-cause">
+                      <span className="root-cause-label">ROOT CAUSE:</span> {finding.root_cause}
                     </div>
+                  )}
 
-                    <p className="finding-desc">{finding.description}</p>
-
-                    <div className="finding-fix-box">
-                      <p className="fix-label">RECOMMENDED FIX</p>
-                      <p className="fix-text">{finding.suggested_fix}</p>
+                  {finding.code_evidence && (
+                    <div className="card-code-evidence">
+                      <pre><code>{finding.code_evidence}</code></pre>
                     </div>
+                  )}
 
-                    {/* Action Area */}
-                    <div className="finding-footer">
-                      {isLow ? (
+                  {finding.potential_impact && (
+                    <div className="card-impact-callout">
+                      <AlertCircle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
+                      <span><strong>Impact:</strong> {finding.potential_impact}</span>
+                    </div>
+                  )}
+
+                  {finding.affected_files && finding.affected_files.length > 0 && (
+                    <div className="card-affected-files">
+                      <span className="affected-label">Affected ({finding.affected_files.length}):</span>
+                      {finding.affected_files.slice(0, 3).map((f) => (
+                        <span key={f} className="affected-pill">{f.split("/").pop()}</span>
+                      ))}
+                      {finding.affected_files.length > 3 && (
+                        <span className="affected-more">+{finding.affected_files.length - 3} more</span>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="card-action-box" onClick={(e) => e.stopPropagation()}>
+                    {finding.severity === "Low" ? (
+                      <div>
+                        <p className="fix-preview-text">
+                          <strong style={{ color: "var(--emerald-400)" }}>AI Solution:</strong>{" "}
+                          {finding.suggested_fix}
+                        </p>
                         <button
                           type="button"
                           disabled={isAutoSolving}
@@ -849,6 +924,10 @@ export default function App() {
           workspaceRoot={graph?.repo_root}
         />
 
+        {/* Multi-Model AI Router Hub */}
+        <ModelRouterModal
+          isOpen={routerOpen}
+          onClose={() => setRouterOpen(false)}
         {/* Onboarding Guide Modal */}
         <OnboardingModal
           open={onboardingOpen}
