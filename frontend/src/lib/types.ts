@@ -5,6 +5,12 @@ export type GraphNodeData = {
   kind: NodeKind | string;
   path?: string;
   highlighted?: boolean;
+  lineno?: number;
+  end_lineno?: number;
+  docstring?: string;
+  bases?: string[];
+  args?: string[];
+  calls?: string[];
   [key: string]: unknown;
 };
 

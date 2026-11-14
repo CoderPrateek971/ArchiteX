@@ -10,6 +10,7 @@ import {
   X,
 } from "lucide-react";
 import type { OnboardingDocResponse } from "../lib/types";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 
 type Props = {
   open: boolean;
@@ -165,7 +166,7 @@ export default function OnboardingModal({
             </div>
           ) : doc ? (
             <div className="markdown-preview">
-              <pre className="markdown-pre">{doc.markdown}</pre>
+              <MarkdownRenderer content={doc.markdown} />
             </div>
           ) : (
             <div className="onboarding-empty">

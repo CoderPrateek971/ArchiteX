@@ -12,6 +12,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import type { ArchitectureReport, FileResponsibility } from "../lib/types";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 
 type Props = {
   report: ArchitectureReport | null;
@@ -104,7 +105,9 @@ export default function ArchitectureView({
                   </span>
                 )}
               </div>
-              <p className="arch-overview-text">{report.system_overview}</p>
+              <div className="arch-overview-text">
+                <MarkdownRenderer content={report.system_overview} compact />
+              </div>
 
               {report.key_technologies.length > 0 && (
                 <div className="tech-tags-list">
