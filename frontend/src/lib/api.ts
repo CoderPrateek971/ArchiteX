@@ -1,6 +1,8 @@
 import axios from "axios";
 import type {
   ComparisonReport,
+  ArchitectureReport,
+  CodebaseQnAResponse,
   DebtReport,
   GraphPayload,
   GuidedRepairPlan,
@@ -12,6 +14,7 @@ import type {
   TaskType,
   TestValidationRequest,
   TestValidationResult,
+  OnboardingDocResponse,
 } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
@@ -37,6 +40,14 @@ export async function uploadRepo(file: File): Promise<GraphPayload> {
   const form = new FormData();
   form.append("file", file);
   const { data } = await api.post<GraphPayload>("/api/upload-repo", form);
+  return data;
+}
+
+export async function cloneRepo(url: string, branch?: string): Promise<GraphPayload> {
+  const { data } = await api.post<GraphPayload>("/api/clone-repo", {
+    url: url.trim(),
+    branch: branch?.trim() || undefined,
+  });
   return data;
 }
 
@@ -101,5 +112,28 @@ export async function validateRepairTests(
   payload: TestValidationRequest
 ): Promise<TestValidationResult> {
   const { data } = await api.post<TestValidationResult>("/api/repair/validate-tests", payload);
+export async function deleteWorkspace(workspaceId: string): Promise<void> {
+  try {
+    await api.delete(`/api/workspace/${workspaceId}`);
+  } catch (err) {
+    console.warn("Failed to delete workspace:", err);
+  }
+}
+
+export async function explainArchitecture(graph: GraphPayload): Promise<ArchitectureReport> {
+  const { data } = await api.post<ArchitectureReport>("/api/explain-architecture", graph);
+  return data;
+}
+
+export async function generateOnboarding(graph: GraphPayload): Promise<OnboardingDocResponse> {
+  const { data } = await api.post<OnboardingDocResponse>("/api/generate-onboarding", graph);
+  return data;
+}
+
+export async function askCodebase(question: string, graph: GraphPayload): Promise<CodebaseQnAResponse> {
+  const { data } = await api.post<CodebaseQnAResponse>("/api/ask-codebase", {
+    question,
+    graph,
+  });
   return data;
 }

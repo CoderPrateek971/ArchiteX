@@ -1,48 +1,60 @@
 import ast
 import io
+import os
 import tempfile
 import zipfile
 from pathlib import Path
 
-SKIP_DIRS = {
-    ".git",
-    ".hg",
-    ".svn",
-    ".venv",
-    "venv",
-    "__pycache__",
-    "__macosx",
-    "node_modules",
-    "site-packages",
-    ".mypy_cache",
-    ".pytest_cache",
-    "dist",
-    "build",
-}
+from services.project_scanner import (
+    IRRELEVANT_DIRS,
+    MAX_FILE_BYTES,
+    MAX_ZIP_BYTES,
+    detect_repo_root,
+    extract_zip_archive,
+    is_irrelevant_dir,
+    is_python_file,
+    validate_zip_archive,
+)
 
-MAX_ZIP_BYTES = 50 * 1024 * 1024
-MAX_PY_BYTES = 2 * 1024 * 1024
+SKIP_DIRS = IRRELEVANT_DIRS
+MAX_PY_BYTES = MAX_FILE_BYTES
 
 
 def ingest_zip(zip_bytes: bytes) -> dict:
     """Unzip a Python repo and return a React Flow graph of files, classes, functions, and imports."""
-    if len(zip_bytes) > MAX_ZIP_BYTES:
-        raise ValueError("Zip file is too large (max 50MB).")
+    valid, err = validate_zip_archive(zip_bytes)
+    if not valid:
+        raise ValueError(err or "Invalid zip archive.")
 
     with tempfile.TemporaryDirectory() as tmp:
         dest = Path(tmp)
-        _safe_extract(zip_bytes, dest)
-        return build_graph(_detect_repo_root(dest))
+        repo_root = extract_zip_archive(zip_bytes, dest)
+        return build_graph(repo_root)
 
 
-def build_graph(repo_root: Path) -> dict:
+def build_graph(repo_root: Path, python_files: list[Path] | None = None) -> dict:
     parsed_files: list[dict] = []
-    for path in _iter_python_files(repo_root):
+    files_to_parse = python_files if python_files is not None else list(_iter_python_files(repo_root))
+    for path in files_to_parse:
         parsed_files.append(_parse_file(path, repo_root))
 
     file_index = _index_modules(parsed_files)
     nodes: list[dict] = []
     edges: list[dict] = []
+
+    # Symbol lookup maps for inheritance and call dependency resolution
+    class_symbol_map: dict[str, str] = {}
+    func_symbol_map: dict[str, str] = {}
+
+    for file_info in parsed_files:
+        for cls in file_info["classes"]:
+            class_symbol_map[cls["name"]] = _class_id(file_info["path"], cls["name"])
+            class_symbol_map[f"{Path(file_info['path']).stem}.{cls['name']}"] = _class_id(file_info["path"], cls["name"])
+            for m in cls["methods"]:
+                func_symbol_map[f"{cls['name']}.{m['name']}"] = _func_id(file_info["path"], f"{cls['name']}.{m['name']}")
+        for func in file_info["functions"]:
+            func_symbol_map[func["name"]] = _func_id(file_info["path"], func["name"])
+            func_symbol_map[f"{Path(file_info['path']).stem}.{func['name']}"] = _func_id(file_info["path"], func["name"])
 
     for file_info in parsed_files:
         file_id = _file_id(file_info["path"])
@@ -55,6 +67,10 @@ def build_graph(repo_root: Path) -> dict:
                     "path": file_info["path"],
                     "parse_error": file_info.get("parse_error"),
                     "source": file_info.get("source", ""),
+                    "docstring": file_info.get("docstring"),
+                    "classes_count": len(file_info["classes"]),
+                    "functions_count": len(file_info["functions"]),
+                    "imports_count": len(file_info["imports"]),
                 },
             )
         )
@@ -77,15 +93,52 @@ def build_graph(repo_root: Path) -> dict:
             )
             edges.append(_edge(file_id, class_id, kind="contains", label="contains"))
 
+            # Class inheritance dependencies
+            for base in cls["bases"]:
+                base_clean = base.split(".")[-1]
+                target_cls_id = class_symbol_map.get(base) or class_symbol_map.get(base_clean)
+                if target_cls_id and target_cls_id != class_id:
+                    edge_id = f"e:inherits:{class_id}:{target_cls_id}"
+                    if not any(e["id"] == edge_id for e in edges):
+                        edges.append(_edge(class_id, target_cls_id, kind="inherits", label=f"inherits {base_clean}", extra_id=edge_id))
+
             for method in cls["methods"]:
                 method_id = _func_id(file_info["path"], f"{cls['name']}.{method['name']}")
                 nodes.append(_function_node(method_id, file_info["path"], method, parent_class=cls["name"]))
                 edges.append(_edge(class_id, method_id, kind="contains", label="method"))
 
+                # Method call dependencies
+                for called in method.get("calls", []):
+                    called_clean = called.split(".")[-1]
+                    target_func_id = (
+                        func_symbol_map.get(called)
+                        or func_symbol_map.get(called_clean)
+                        or class_symbol_map.get(called)
+                        or class_symbol_map.get(called_clean)
+                    )
+                    if target_func_id and target_func_id != method_id:
+                        edge_id = f"e:calls:{method_id}:{target_func_id}"
+                        if not any(e["id"] == edge_id for e in edges):
+                            edges.append(_edge(method_id, target_func_id, kind="calls", label=f"calls {called_clean}", extra_id=edge_id))
+
         for func in file_info["functions"]:
             func_id = _func_id(file_info["path"], func["name"])
             nodes.append(_function_node(func_id, file_info["path"], func))
             edges.append(_edge(file_id, func_id, kind="contains", label="defines"))
+
+            # Function call dependencies
+            for called in func.get("calls", []):
+                called_clean = called.split(".")[-1]
+                target_func_id = (
+                    func_symbol_map.get(called)
+                    or func_symbol_map.get(called_clean)
+                    or class_symbol_map.get(called)
+                    or class_symbol_map.get(called_clean)
+                )
+                if target_func_id and target_func_id != func_id:
+                    edge_id = f"e:calls:{func_id}:{target_func_id}"
+                    if not any(e["id"] == edge_id for e in edges):
+                        edges.append(_edge(func_id, target_func_id, kind="calls", label=f"calls {called_clean}", extra_id=edge_id))
 
         for imp in file_info["imports"]:
             target_path = _resolve_import(file_info["path"], imp, file_index)
@@ -125,45 +178,24 @@ def build_graph(repo_root: Path) -> dict:
 
 
 def _safe_extract(zip_bytes: bytes, dest: Path) -> None:
-    dest = dest.resolve()
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(zip_bytes))
-    except zipfile.BadZipFile as exc:
-        raise ValueError("Uploaded file is not a valid zip archive.") from exc
-
-    with archive:
-        for info in archive.infolist():
-            name = info.filename.replace("\\", "/")
-            if name.endswith("/") or not name:
-                continue
-            if name.startswith("/") or any(part == ".." for part in Path(name).parts):
-                raise ValueError(f"Unsafe path in zip: {info.filename}")
-
-            target = (dest / name).resolve()
-            if not str(target).startswith(str(dest)):
-                raise ValueError(f"Unsafe path in zip: {info.filename}")
-
-        archive.extractall(dest)
+    extract_zip_archive(zip_bytes, dest)
 
 
 def _detect_repo_root(extracted: Path) -> Path:
-    children = [
-        path
-        for path in extracted.iterdir()
-        if path.name not in {".DS_Store"} and path.name.lower() != "__macosx"
-    ]
-    if len(children) == 1 and children[0].is_dir():
-        return children[0]
-    return extracted
+    return detect_repo_root(extracted)
 
 
 def _iter_python_files(repo_root: Path):
-    for path in repo_root.rglob("*.py"):
-        if any(part.lower() in SKIP_DIRS for part in path.parts):
-            continue
-        if path.stat().st_size > MAX_PY_BYTES:
-            continue
-        yield path
+    for root, dirs, files in os.walk(repo_root):
+        dirs[:] = [d for d in dirs if not is_irrelevant_dir(d)]
+        for f in files:
+            p = Path(root) / f
+            if is_python_file(p):
+                try:
+                    if p.stat().st_size <= MAX_PY_BYTES:
+                        yield p
+                except Exception:
+                    continue
 
 
 def _parse_file(path: Path, repo_root: Path) -> dict:
@@ -235,7 +267,18 @@ def _parse_file(path: Path, repo_root: Path) -> dict:
         "functions": functions,
         "parse_error": None,
         "source": source,
+        "docstring": ast.get_docstring(tree),
     }
+
+
+def _extract_calls(node: ast.AST) -> list[str]:
+    calls: list[str] = []
+    for subnode in ast.walk(node):
+        if isinstance(subnode, ast.Call):
+            name = _expr_name(subnode.func)
+            if name and name not in calls:
+                calls.append(name)
+    return calls
 
 
 def _function_info(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict:
@@ -247,6 +290,7 @@ def _function_info(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict:
         "is_async": isinstance(node, ast.AsyncFunctionDef),
         "docstring": ast.get_docstring(node),
         "decorators": [_expr_name(dec) for dec in node.decorator_list],
+        "calls": _extract_calls(node),
     }
 
 
@@ -326,6 +370,7 @@ def _function_node(node_id: str, path: str, func: dict, parent_class: str | None
             "is_async": func["is_async"],
             "docstring": func["docstring"],
             "decorators": func["decorators"],
+            "calls": func.get("calls", []),
             "parent_class": parent_class,
         },
     )
