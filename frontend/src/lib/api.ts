@@ -15,6 +15,8 @@ import type {
   TestValidationRequest,
   TestValidationResult,
   OnboardingDocResponse,
+  RepairApplyRequest,
+  RepairApplyResult,
 } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
@@ -75,6 +77,15 @@ export async function rollbackLedgerChange(id: number, workspaceRoot?: string): 
 }
 
 // =====================================================================
+// Module 6: Automatic Repair Engine API
+// =====================================================================
+
+export async function applyAutomaticRepair(payload: RepairApplyRequest): Promise<RepairApplyResult> {
+  const { data } = await api.post<RepairApplyResult>("/api/repair/apply", payload);
+  return data;
+}
+
+// =====================================================================
 // Module 4: Multi-Model AI Router API
 // =====================================================================
 
@@ -112,6 +123,8 @@ export async function validateRepairTests(
   payload: TestValidationRequest
 ): Promise<TestValidationResult> {
   const { data } = await api.post<TestValidationResult>("/api/repair/validate-tests", payload);
+  return data;
+}
 export async function deleteWorkspace(workspaceId: string): Promise<void> {
   try {
     await api.delete(`/api/workspace/${workspaceId}`);

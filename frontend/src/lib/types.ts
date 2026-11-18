@@ -245,7 +245,7 @@ export type DebtReport = {
 };
 
 export type LedgerChangedBy = "AI" | "User";
-export type LedgerStatus = "active" | "rolled_back";
+export type LedgerStatus = "active" | "rolled_back" | "failed";
 export type LedgerSeverity = "low" | "medium" | "high";
 
 export type LedgerEntry = {
@@ -254,10 +254,15 @@ export type LedgerEntry = {
   file_path: string;
   previous_code: string;
   new_code: string;
-  severity: LedgerSeverity;
-  changed_by: LedgerChangedBy;
+  severity: LedgerSeverity | string;
+  changed_by: LedgerChangedBy | string;
   details?: string;
-  status: LedgerStatus;
+  issue_id?: string | null;
+  validation_result?: string | null;
+  status: LedgerStatus | string;
+  rollback_ref?: number | null;
+  before_hash?: string | null;
+  after_hash?: string | null;
 };
 
 export type LedgerLogRequest = {
@@ -265,9 +270,40 @@ export type LedgerLogRequest = {
   previous_code: string;
   new_code: string;
   severity: string;
-  changed_by: LedgerChangedBy;
+  changed_by: LedgerChangedBy | string;
   details?: string;
+  issue_id?: string;
+  validation_result?: string;
   workspace_root?: string;
+};
+
+// =====================================================================
+// Module 6: Automatic Repair Engine Types
+// =====================================================================
+
+export type RepairApplyRequest = {
+  issue_id: string;
+  file_path: string;
+  severity: string;
+  proposed_code: string;
+  workspace_root?: string | null;
+  workspace_id?: string | null;
+  approval: boolean;
+  original_code_hash?: string | null;
+  expected_original_code?: string | null;
+};
+
+export type RepairApplyResult = {
+  success: boolean;
+  issue_id: string;
+  file_path: string;
+  severity: string;
+  validation_status: "PASSED" | "FAILED" | "REJECTED" | "BLOCKED" | "CONFLICT" | string;
+  output_logs: string;
+  rollback_status: "NOT_NEEDED" | "RESTORED" | "NOT_APPLICABLE" | string;
+  explanation: string;
+  change_id?: number | null;
+  details?: { file: string; check: string; status: string; error?: string }[];
 };
 
 // =====================================================================

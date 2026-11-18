@@ -37,6 +37,19 @@ from services.llm_router import (
     get_model_profiles,
     route_and_generate,
 )
+from services.workspace_manager import (
+    create_workspace_from_zip,
+    create_workspace_from_git,
+    read_workspace_file,
+    cleanup_workspace,
+)
+from database import ledger
+from database.ledger import ConflictError
+from services.repair_engine import (
+    RepairApplyRequest,
+    RepairApplyResult,
+    apply_repair_request,
+)
 
 app = FastAPI(title="ArchiteX API", version="0.1.0")
 
@@ -49,26 +62,7 @@ app.add_middleware(
 )
 
 # --- 1. Database Initialization ---
-def init_db():
-    conn = sqlite3.connect('ledger.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS ledger (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            file_path TEXT,
-            severity TEXT,
-            changed_by TEXT,
-            details TEXT,
-            previous_code TEXT,
-            new_code TEXT,
-            status TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-init_db()
+ledger.init_db()
 
 # --- 2. Pydantic Models ---
 class PromptRequest(BaseModel):
@@ -95,11 +89,13 @@ class RouterCompareRequest(BaseModel):
 class LedgerLogRequest(BaseModel):
     file_path: str
     severity: str
-    changed_by: str
-    details: str
-    previous_code: str
-    new_code: str
+    changed_by: str = "AI"
+    details: Optional[str] = ""
+    previous_code: Optional[str] = ""
+    new_code: Optional[str] = ""
     workspace_root: Optional[str] = None
+    issue_id: Optional[str] = None
+    validation_result: Optional[str] = None
 
 class RollbackRequest(BaseModel):
     id: int
@@ -231,96 +227,52 @@ def ask_codebase_endpoint(request: AskCodebaseRequest) -> CodebaseQnAResponse:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Codebase Q&A failed: {exc}") from exc
 
-# --- 4. Ledger & Physical File Modification Endpoints ---
+# --- 4. Ledger & Automatic Repair Endpoints ---
 @app.get("/api/ledger")
 def get_ledger() -> List[dict]:
-    conn = sqlite3.connect('ledger.db')
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM ledger ORDER BY id DESC")
-    rows = cursor.fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
+    entries = ledger.list_logs()
+    return [e.model_dump() for e in entries]
 
 @app.post("/api/ledger/log")
 def log_ledger_change(request: LedgerLogRequest):
-    timestamp = datetime.now().isoformat()
-    
-    # Handle workspace_root if frontend provides it
-    file_path = request.file_path
-    if request.workspace_root:
-        file_path = os.path.join(request.workspace_root, request.file_path)
-
-    actual_previous_code = request.previous_code
-
-    # ⚡ PHYSICAL FILE OVERWRITE LOGIC ⚡
-    if os.path.exists(file_path):
-        try:
-            # 1. Read and save the EXACT original code to ensure rollback works perfectly
-            with open(file_path, 'r', encoding='utf-8') as f:
-                actual_previous_code = f.read()
-            
-            # 2. Overwrite the file with the new code
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(request.new_code)
-                
-            print(f"✅ Physically updated file: {file_path}")
-        except Exception as e:
-            print(f"⚠️ Failed to write to {file_path}: {e}")
-    else:
-        # If running from a temporary .zip extraction, it skips safely
-        print(f"⚠️ File not found on disk (skipping physical write): {file_path}")
-
-    # SAVE TO DB
-    conn = sqlite3.connect('ledger.db')
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO ledger (timestamp, file_path, severity, changed_by, details, previous_code, new_code, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
-    ''', (timestamp, request.file_path, request.severity, request.changed_by, request.details, actual_previous_code, request.new_code))
-    
-    conn.commit()
-    cursor.execute("SELECT * FROM ledger WHERE id = last_insert_rowid()")
-    new_row = dict(cursor.fetchone())
-    conn.close()
-    
-    return new_row
+    try:
+        entry = ledger.insert_log(
+            file_path=request.file_path,
+            previous_code=request.previous_code or "",
+            new_code=request.new_code or "",
+            severity=request.severity,
+            changed_by=request.changed_by,
+            details=request.details,
+            issue_id=request.issue_id,
+            validation_result=request.validation_result,
+            workspace_root=request.workspace_root,
+            write_to_disk=True,
+        )
+        return entry.model_dump()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 @app.post("/api/ledger/rollback")
 def rollback_ledger_change(request: RollbackRequest):
-    conn = sqlite3.connect('ledger.db')
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT previous_code, file_path FROM ledger WHERE id = ?", (request.id,))
-    record = cursor.fetchone()
-    
-    if not record:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Log not found")
-        
-    previous_code = record["previous_code"]
-    file_path = record["file_path"]
+    try:
+        updated = ledger.rollback_change(request.id, workspace_root=request.workspace_root)
+        return updated.model_dump()
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    if request.workspace_root:
-        file_path = os.path.join(request.workspace_root, file_path)
-    
-    # ⚡ PHYSICAL FILE ROLLBACK LOGIC ⚡
-    if os.path.exists(file_path) and previous_code:
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(previous_code)
-            print(f"⏪ Physically rolled back file: {file_path}")
-        except Exception as e:
-            print(f"⚠️ Failed to rollback {file_path}: {e}")
-
-    # Update DB status
-    cursor.execute("UPDATE ledger SET status = 'rolled_back' WHERE id = ?", (request.id,))
-    conn.commit()
-    
-    cursor.execute("SELECT * FROM ledger WHERE id = ?", (request.id,))
-    updated_row = dict(cursor.fetchone())
-    conn.close()
-    
-    return updated_row
+@app.post("/api/repair/apply", response_model=RepairApplyResult)
+def apply_repair_endpoint(request: RepairApplyRequest) -> RepairApplyResult:
+    try:
+        return apply_repair_request(request)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Automatic repair engine error: {exc}") from exc

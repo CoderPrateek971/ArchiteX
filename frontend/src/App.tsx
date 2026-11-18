@@ -32,6 +32,7 @@ import {
   cloneRepo,
   deleteWorkspace,
   errorMessage,
+  applyAutomaticRepair,
   explainArchitecture,
   generateOnboarding,
   logLedgerChange,
@@ -245,7 +246,7 @@ export default function App() {
     }
   };
 
-  // Handle AI Auto-Solving for Low Severity Issues
+  // Handle AI Auto-Solving for Low Severity Issues using Module 6 Repair Engine
   const handleAutoSolve = async (finding: DebtFinding) => {
     const cleanFileName = finding.file_name.replace(/^file:/, "");
     const findingKey = `${finding.file_name}-${finding.line_number ?? 0}`;
@@ -257,24 +258,27 @@ export default function App() {
       `# [ArchiteX Auto-Solve] Resolved ${finding.title || "Low severity debt"}\n`;
 
     try {
-      await logLedgerChange({
+      const res = await applyAutomaticRepair({
+        issue_id: finding.id || `ISSUE-${cleanFileName}-${finding.line_number ?? 0}`,
         file_path: cleanFileName,
-        severity: finding.severity.toLowerCase(),
-        changed_by: "AI",
-        details: `AI Auto-Solved: ${finding.title || finding.suggested_fix}`,
-        previous_code: "Original code prior to auto-solve",
-        new_code: proposedCode,
+        severity: finding.severity,
+        proposed_code: proposedCode,
         workspace_root: graph?.repo_root,
+        approval: true,
       });
 
-      // Remove the solved issue from the list
-      setFindings((prev) =>
-        prev.filter((f) => !(f.file_name === finding.file_name && f.line_number === finding.line_number))
-      );
-      setLedgerRefresh((prev) => prev + 1);
+      if (res.success) {
+        // Remove the solved issue from the list
+        setFindings((prev) =>
+          prev.filter((f) => !(f.file_name === finding.file_name && f.line_number === finding.line_number))
+        );
+        setLedgerRefresh((prev) => prev + 1);
+      } else {
+        alert(`Automatic repair rejected or failed:\n${res.explanation}`);
+      }
     } catch (err) {
       console.error(err);
-      alert("Failed to record fix in ledger. Please check backend status.");
+      alert(`Failed to apply repair: ${errorMessage(err)}`);
     } finally {
       setAutoSolvingId(null);
     }
@@ -295,7 +299,7 @@ export default function App() {
               <p className="brand-subtitle">AI Architecture Intelligence</p>
             </div>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <div className="header-actions">
             <button
               type="button"
               onClick={() => setRouterOpen(true)}
@@ -305,7 +309,6 @@ export default function App() {
             >
               <Cpu size={18} />
             </button>
-          <div className="header-actions">
             {graph && (
               <>
                 <button
@@ -721,14 +724,14 @@ export default function App() {
                         </p>
                         <button
                           type="button"
-                          disabled={isAutoSolving}
+                          disabled={isSolvingThis}
                           onClick={(e) => {
                             e.stopPropagation();
                             void handleAutoSolve(finding);
                           }}
                           className="btn-autosolve"
                         >
-                          {isAutoSolving ? (
+                          {isSolvingThis ? (
                             <>
                               <Loader2 size={13} className="animate-spin" />
                               <span>Auto-Solving…</span>
@@ -740,6 +743,7 @@ export default function App() {
                             </>
                           )}
                         </button>
+                      </div>
                       ) : (
                         <div style={{ display: "flex", width: "100%", justifyContent: "flex-end" }}>
                           <button
@@ -928,6 +932,7 @@ export default function App() {
         <ModelRouterModal
           isOpen={routerOpen}
           onClose={() => setRouterOpen(false)}
+        />
         {/* Onboarding Guide Modal */}
         <OnboardingModal
           open={onboardingOpen}
