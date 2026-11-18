@@ -5,6 +5,7 @@ import os
 import py_compile
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from collections import defaultdict, deque
@@ -389,9 +390,10 @@ def validate_repair_with_tests(
         if has_tests and req.run_pytest:
             test_executed = True
             try:
-                cmd = ["pytest", "-v", req.workspace_root]
+                cmd = [sys.executable, "-m", "pytest", "-v", "."]
                 proc = subprocess.run(
                     cmd,
+                    cwd=req.workspace_root,
                     capture_output=True,
                     text=True,
                     timeout=12,

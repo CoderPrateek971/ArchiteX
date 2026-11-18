@@ -1,5 +1,18 @@
 import { useEffect, useState } from "react";
-import { History, Loader2, RotateCcw, X, Bot, User, CheckCircle2 } from "lucide-react";
+import {
+  History,
+  Loader2,
+  RotateCcw,
+  X,
+  Bot,
+  User,
+  CheckCircle2,
+  AlertTriangle,
+  FileCode,
+  Tag,
+  ShieldCheck,
+  ShieldAlert,
+} from "lucide-react";
 import { errorMessage, fetchLedger, rollbackLedgerChange } from "../lib/api";
 import type { LedgerEntry } from "../lib/types";
 
@@ -21,6 +34,7 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
   const [loading, setLoading] = useState(false);
   const [rollingBack, setRollingBack] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [conflictWarning, setConflictWarning] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -28,6 +42,7 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setConflictWarning(null);
 
     fetchLedger()
       .then((data) => {
@@ -47,17 +62,27 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
 
   async function handleRollback(id: number) {
     const confirmed = window.confirm(
-      "Are you sure you want to rollback this change? This will revert the physical file on disk to its previous state."
+      "Are you sure you want to rollback change #" +
+        id +
+        "? ArchiteX will verify that the file has not been modified since this change was recorded before reverting."
     );
     if (!confirmed) return;
 
     setRollingBack(id);
     setError(null);
+    setConflictWarning(null);
     try {
       const updated = await rollbackLedgerChange(id, workspaceRoot);
       setEntries((current) => current.map((entry) => (entry.id === id ? updated : entry)));
-    } catch (err) {
-      setError(errorMessage(err));
+    } catch (err: any) {
+      const msg = errorMessage(err);
+      if (err?.response?.status === 409 || msg.toLowerCase().includes("conflict")) {
+        setConflictWarning(
+          `Rollback Blocked (Conflict Detected): ${msg}. The file has newer modifications that would be lost. ArchiteX prevented overwriting your changes.`
+        );
+      } else {
+        setError(msg);
+      }
     } finally {
       setRollingBack(null);
     }
@@ -85,8 +110,10 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
               <History size={16} />
             </span>
             <div>
-              <h2 className="ledger-header-title">Smart Ledger & Rollback</h2>
-              <p className="ledger-header-subtitle">Time-travel across all AI & User modifications</p>
+              <h2 className="ledger-header-title">Audit Ledger & Rollback Engine</h2>
+              <p className="ledger-header-subtitle">
+                Issue attribution, selective rollback & conflict protection
+              </p>
             </div>
           </div>
           <button
@@ -101,9 +128,45 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
 
         <div className="ledger-body">
           {loading && (
-            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "var(--text-muted)", padding: 12 }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                fontSize: 13,
+                color: "var(--text-muted)",
+                padding: 12,
+              }}
+            >
               <Loader2 size={16} className="animate-spin" color="var(--cyan-400)" />
               <span>Fetching Smart Ledger history…</span>
+            </div>
+          )}
+
+          {/* Prominent Conflict Warning Banner */}
+          {conflictWarning && (
+            <div
+              style={{
+                padding: "10px 14px",
+                marginBottom: 12,
+                borderRadius: "var(--radius-sm)",
+                background: "rgba(239, 68, 68, 0.15)",
+                border: "1px solid var(--red-400)",
+                color: "var(--red-400)",
+                fontSize: 12,
+                display: "flex",
+                gap: 10,
+                alignItems: "flex-start",
+                lineHeight: 1.4,
+              }}
+            >
+              <AlertTriangle size={18} style={{ flexShrink: 0, marginTop: 1 }} />
+              <div>
+                <strong style={{ display: "block", marginBottom: 2 }}>
+                  Rollback Conflict Detected
+                </strong>
+                <span>{conflictWarning}</span>
+              </div>
             </div>
           )}
 
@@ -111,38 +174,71 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
 
           {!loading && entries.length === 0 && !error && (
             <div className="empty-state">
-              No modifications recorded yet. Any auto-solve or accepted remediation plan will automatically be saved here.
+              No modifications recorded yet. Any automatic repair, developer edit, or accepted
+              remediation plan will automatically be saved here.
             </div>
           )}
 
           <div className="timeline">
             {entries.map((entry) => {
               const isRolledBack = entry.status === "rolled_back";
+              const isFailed = entry.status === "failed";
               const isAI = entry.changed_by === "AI";
+              const cleanPath = entry.file_path.replace(/^file:/, "");
 
               return (
                 <div key={entry.id} className="timeline-item">
                   <span
                     className="timeline-dot"
-                    style={{ borderColor: isRolledBack ? "var(--text-muted)" : "var(--cyan-400)" }}
+                    style={{
+                      borderColor: isRolledBack
+                        ? "var(--text-muted)"
+                        : isFailed
+                        ? "var(--red-400)"
+                        : "var(--cyan-400)",
+                    }}
                   />
 
                   <div className="ledger-entry-card">
+                    {/* Header: Change ID, File Path, Source & Timestamp */}
                     <div className="ledger-entry-header">
                       <div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                          <span
+                            style={{
+                              fontSize: 11,
+                              fontFamily: "var(--font-mono)",
+                              background: "rgba(255, 255, 255, 0.08)",
+                              padding: "1px 6px",
+                              borderRadius: "var(--radius-sm)",
+                              color: "var(--cyan-400)",
+                              fontWeight: 600,
+                            }}
+                          >
+                            #{entry.id}
+                          </span>
                           {isAI ? (
                             <Bot size={14} color="var(--emerald-400)" />
                           ) : (
                             <User size={14} color="var(--cyan-400)" />
                           )}
-                          <span className="ledger-file-name">{entry.file_path}</span>
+                          <span className="ledger-file-name" title={cleanPath}>
+                            {cleanPath}
+                          </span>
                         </div>
                         <p className="ledger-time">{formatTime(entry.timestamp)}</p>
                       </div>
 
+                      {/* Badges: Severity and Changed-By */}
                       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <span className={`severity-pill ${entry.severity ? entry.severity.charAt(0).toUpperCase() + entry.severity.slice(1).toLowerCase() : "Low"}`}>
+                        <span
+                          className={`severity-pill ${
+                            entry.severity
+                              ? entry.severity.charAt(0).toUpperCase() +
+                                entry.severity.slice(1).toLowerCase()
+                              : "Low"
+                          }`}
+                        >
                           {entry.severity}
                         </span>
                         <span
@@ -160,37 +256,137 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
                       </div>
                     </div>
 
+                    {/* Issue ID and Validation Badges */}
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        margin: "6px 0 8px 0",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      {entry.issue_id && (
+                        <span
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 4,
+                            fontSize: 10,
+                            fontFamily: "var(--font-mono)",
+                            color: "var(--violet-400)",
+                            background: "rgba(167, 139, 250, 0.12)",
+                            padding: "2px 6px",
+                            borderRadius: "var(--radius-sm)",
+                          }}
+                        >
+                          <Tag size={10} />
+                          Issue: {entry.issue_id}
+                        </span>
+                      )}
+
+                      {entry.validation_result && (
+                        <span
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 4,
+                            fontSize: 10,
+                            fontFamily: "var(--font-mono)",
+                            color:
+                              entry.validation_result.toUpperCase().includes("PASSED")
+                                ? "var(--emerald-400)"
+                                : "var(--red-400)",
+                            background:
+                              entry.validation_result.toUpperCase().includes("PASSED")
+                                ? "var(--emerald-bg)"
+                                : "rgba(239, 68, 68, 0.15)",
+                            padding: "2px 6px",
+                            borderRadius: "var(--radius-sm)",
+                          }}
+                          title={entry.validation_result}
+                        >
+                          {entry.validation_result.toUpperCase().includes("PASSED") ? (
+                            <ShieldCheck size={10} />
+                          ) : (
+                            <ShieldAlert size={10} />
+                          )}
+                          Validation: {entry.validation_result.toUpperCase().includes("PASSED") ? "PASSED" : "FAILED"}
+                        </span>
+                      )}
+                    </div>
+
                     {entry.details && (
-                      <p style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 8, lineHeight: 1.4 }}>
+                      <p
+                        style={{
+                          fontSize: 11,
+                          color: "var(--text-secondary)",
+                          marginBottom: 8,
+                          lineHeight: 1.4,
+                        }}
+                      >
                         {entry.details}
                       </p>
                     )}
 
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 10, paddingTop: 8, borderTop: "1px solid var(--border-subtle)" }}>
+                    {/* Footer: Status Badge and Selective Rollback Action */}
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        marginTop: 10,
+                        paddingTop: 8,
+                        borderTop: "1px solid var(--border-subtle)",
+                      }}
+                    >
                       <span
                         style={{
                           fontSize: 11,
                           display: "flex",
                           alignItems: "center",
                           gap: 4,
-                          color: isRolledBack ? "var(--text-muted)" : "var(--emerald-400)",
+                          color: isRolledBack
+                            ? "var(--text-muted)"
+                            : isFailed
+                            ? "var(--red-400)"
+                            : "var(--emerald-400)",
                         }}
                       >
-                        {isRolledBack ? "Reverted" : <><CheckCircle2 size={12} /> Active</>}
+                        {isRolledBack ? (
+                          "Rolled Back"
+                        ) : isFailed ? (
+                          <>
+                            <ShieldAlert size={12} /> Failed Repair
+                          </>
+                        ) : (
+                          <>
+                            <CheckCircle2 size={12} /> Active
+                          </>
+                        )}
                       </span>
 
                       <button
                         type="button"
-                        disabled={isRolledBack || rollingBack === entry.id}
+                        disabled={isRolledBack || isFailed || rollingBack === entry.id}
                         onClick={() => void handleRollback(entry.id)}
                         className="btn-rollback"
+                        title={
+                          isRolledBack
+                            ? "This change has already been rolled back"
+                            : isFailed
+                            ? "Cannot roll back a failed repair attempt"
+                            : "Selectively rollback this modification with conflict detection"
+                        }
                       >
                         {rollingBack === entry.id ? (
                           <Loader2 size={12} className="animate-spin" />
                         ) : (
                           <RotateCcw size={12} />
                         )}
-                        <span>{isRolledBack ? "Rolled Back" : "Rollback File"}</span>
+                        <span>
+                          {isRolledBack ? "Rolled Back" : isFailed ? "Failed" : "Rollback File"}
+                        </span>
                       </button>
                     </div>
                   </div>

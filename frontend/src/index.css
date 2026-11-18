@@ -1604,8 +1604,9 @@ html, body, #root {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   padding: 12px;
-   Architecture Intelligence, Onboarding & Q&A Styles
-   ===================================================================== */
+}
+   /* Architecture Intelligence, Onboarding & Q&A Styles
+   ===================================================================== */ 
 
 .header-actions {
   display: flex;
