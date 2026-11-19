@@ -10,8 +10,9 @@ from collections import defaultdict
 from enum import Enum
 from typing import Any, Optional
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from pydantic import BaseModel, Field
+from pathlib import Path
 
 # Ensure packaging alias for environments where pip has vendored packaging
 try:
@@ -50,8 +51,56 @@ except Exception:
     ServiceUnavailableError = Exception
     Timeout = Exception
 
-load_dotenv()
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(dotenv_path=ENV_FILE)
 logger = logging.getLogger(__name__)
+
+
+def get_llm_connection_status() -> dict[str, Any]:
+    gemini_configured = is_key_configured("GEMINI_API_KEY")
+    openai_configured = is_key_configured("OPENAI_API_KEY")
+    model = get_codebase_qa_model()
+    provider = "gemini" if model.startswith("gemini/") and gemini_configured else (
+        "openai" if model.startswith("gpt-") and openai_configured else "none"
+    )
+    return {
+        "connected": provider != "none" and LITELLM_AVAILABLE,
+        "primary_model": model,
+        "fallback_model": "architex-local-engine",
+        "has_gemini_key": gemini_configured,
+        "has_openai_key": openai_configured,
+        "active_provider": provider,
+    }
+
+
+def save_gemini_api_key(api_key: str) -> dict[str, Any]:
+    cleaned = api_key.strip()
+    if not cleaned or len(cleaned) > 512 or "\n" in cleaned or "\r" in cleaned:
+        raise ValueError("Enter a valid Gemini API key.")
+    if cleaned.lower().startswith(("your-", "placeholder", "xxx")):
+        raise ValueError("The Gemini API key cannot be a placeholder value.")
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    set_key(str(ENV_FILE), "GEMINI_API_KEY", cleaned, quote_mode="always")
+    try:
+        os.chmod(ENV_FILE, 0o600)
+    except OSError:
+        logger.warning("Could not restrict permissions on backend environment file")
+    os.environ["GEMINI_API_KEY"] = cleaned
+    return get_llm_connection_status()
+
+
+def get_codebase_qa_model() -> str:
+    configured = os.getenv("CODEBASE_QA_MODEL", "").strip()
+    if configured:
+        return configured
+    primary = os.getenv("PRIMARY_LLM_MODEL", "").strip()
+    # Respect the Gemini model already selected in backend/.env. Previously,
+    # the presence of a key forced an older hard-coded model and ignored this.
+    if primary.startswith("gemini/") and is_key_configured("GEMINI_API_KEY"):
+        return primary
+    if is_key_configured("GEMINI_API_KEY"):
+        return "gemini/gemini-3.8-flash"
+    return primary or "architex-local-engine"
 
 
 # =====================================================================
@@ -439,7 +488,12 @@ def route_and_generate(
     detected_task = task_type or classify_task(prompt)
     if override_model:
         primary_model = override_model
-        fallback_chain = [override_model, "architex-local-engine"]
+        fallback_chain = [override_model]
+        if override_model.startswith("gemini/") and is_key_configured("GEMINI_API_KEY"):
+            # Keep Q&A on Gemini if the configured model ID is unavailable to
+            # this API key, before dropping to the local AST answer.
+            fallback_chain.append("gemini/gemini-3.8-flash")
+        fallback_chain.append("architex-local-engine")
     else:
         primary_model, fallback_chain = select_best_model(detected_task, strategy)
 
@@ -469,14 +523,15 @@ def route_and_generate(
             break
 
         if not LITELLM_AVAILABLE or completion is None:
+            fallback_reason = "LiteLLM is unavailable in the backend; used the local AST fallback."
             continue
 
         try:
             kwargs: dict[str, Any] = {
                 "model": candidate,
                 "messages": messages,
-                "timeout": 7,
-                "num_retries": 0,
+                "timeout": 30,
+                "num_retries": 1,
             }
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
@@ -503,10 +558,29 @@ def route_and_generate(
             logger.warning("Model %s failed (%s). Triggering circuit breaker and trying next fallback.", candidate, err_msg)
             HEALTH_TRACKER.record_failure(candidate, str(exc), is_rate_limit=is_rl)
             fallback_used = True
-            fallback_reason = f"Model `{candidate}` experienced {err_msg} (Circuit breaker tripped). Fallback engaged."
+            if isinstance(exc, ServiceUnavailableError):
+                fallback_reason = f"Gemini is temporarily unavailable for `{candidate}` (503). Retry in a moment."
+            elif isinstance(exc, RateLimitError) or is_rl:
+                fallback_reason = f"Gemini rate limit reached for `{candidate}`. Wait briefly, then retry."
+            elif isinstance(exc, AuthenticationError):
+                fallback_reason = "Gemini rejected the API key. Check GEMINI_API_KEY in backend/.env."
+            elif isinstance(exc, NotFoundError):
+                fallback_reason = f"Gemini does not recognize model `{candidate}`. Check the model ID in backend/.env."
+            elif isinstance(exc, APIConnectionError) or isinstance(exc, Timeout):
+                fallback_reason = "Could not connect to Gemini. Check the network connection and retry."
+            else:
+                fallback_reason = f"Gemini request failed for `{candidate}` ({err_msg})."
             continue
         except Exception as exc:
-            HEALTH_TRACKER.record_failure(candidate, str(exc))
+            raw_error = str(exc).strip() or type(exc).__name__
+            configured_key = os.getenv("GEMINI_API_KEY", "")
+            if configured_key:
+                raw_error = raw_error.replace(configured_key, "[redacted]")
+            raw_error = raw_error[:240]
+            logger.warning("Model %s failed unexpectedly (%s): %s", candidate, type(exc).__name__, raw_error)
+            HEALTH_TRACKER.record_failure(candidate, raw_error)
+            fallback_reason = f"Gemini request failed for `{candidate}`: {raw_error}"
+            fallback_used = True
             continue
 
     total_latency = (time.time() - start_time) * 1000

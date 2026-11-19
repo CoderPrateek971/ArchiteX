@@ -1295,17 +1295,32 @@ def _generate_proposed_code(file_path: str, source: str, item: dict[str, Any]) -
         if replaced:
             return "".join(new_lines)
 
-    # 2. Wildcard import: from x import * -> import x
+    # 2. Wildcard import: replace the math wildcard with only the math symbols
+    # referenced by this file. Other modules need export analysis before they can
+    # be changed safely, so leave them without an automatic patch.
     if "Wildcard Import" in title and line_no and 1 <= line_no <= len(lines):
         line = lines[line_no - 1]
         match = re.search(r"from\s+([a-zA-Z0-9_\.]+)\s+import\s+\*", line)
-        if match:
-            mod_name = match.group(1)
-            lines[line_no - 1] = f"import {mod_name}  # Explicit import replacing wildcard `*`\n"
-            return "".join(lines)
+        if not match or match.group(1) != "math":
+            return ""
+        try:
+            import math
+            tree = ast.parse(source, filename=file_path)
+        except (SyntaxError, ImportError):
+            return ""
+        math_exports = {name for name in dir(math) if not name.startswith("_")}
+        used_math_names = sorted({
+            node.id for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in math_exports
+        })
+        if used_math_names:
+            newline = "\r\n" if "\r\n" in line else "\n"
+            lines[line_no - 1] = f"from math import {', '.join(used_math_names)}{newline}"
         else:
-            lines[line_no - 1] = line.replace("*", "# TODO: Explicit imported symbols")
-            return "".join(lines)
+            lines[line_no - 1] = ""
+        return "".join(lines)
 
     # 3. Weak or Non-Descriptive Naming: rename function cleanly while keeping body
     if "Weak or Non-Descriptive Naming" in title and line_no and 1 <= line_no <= len(lines):
@@ -1314,7 +1329,12 @@ def _generate_proposed_code(file_path: str, source: str, item: dict[str, Any]) -
         if match:
             old_name = match.group(1)
             better_name = "calculate_metric" if "terrible" in old_name else ("process_data" if "bad" in old_name else f"run_{old_name}")
-            lines[line_no - 1] = line.replace(f"def {old_name}(", f"def {better_name}(  # Renamed from {old_name}\n")
+            lines[line_no - 1] = re.sub(
+                rf"(\bdef\s+){re.escape(old_name)}(?=\s*\()",
+                rf"\g<1>{better_name}",
+                line,
+                count=1,
+            )
             return "".join(lines)
 
     # 4. Mutable default argument: def f(x=[]): -> def f(x=None): if x is None: x = []
@@ -1397,9 +1417,8 @@ def _generate_proposed_code(file_path: str, source: str, item: dict[str, Any]) -
         lines.insert(line_no, docstring_line)
         return "".join(lines)
 
-    # Fallback: Targeted comment with problem-specific fix
-    comment = f"# [ArchiteX Fix] {item['title']}: {item['suggested_fix']}\n"
-    return comment + source
+    # Do not present a comment-only change as an automatic repair.
+    return ""
 
 
 def _detect_import_cycles(adj: dict[str, set[str]]) -> list[list[str]]:

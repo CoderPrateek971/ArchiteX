@@ -2,13 +2,14 @@ import json
 import logging
 import os
 import re
+import ast
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 from services.debt_detector import GraphPayload
-from services.llm_router import generate_completion
+from services.llm_router import TaskType, get_codebase_qa_model, route_and_generate
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ class CodebaseQnAResponse(BaseModel):
     relevant_symbols: list[str] = Field(default_factory=list)
     model_used: Optional[str] = None
     fallback_used: bool = False
+    fallback_reason: Optional[str] = None
 
 
 # =====================================================================
@@ -96,6 +98,7 @@ def analyze_codebase_architecture(payload: GraphPayload) -> ArchitectureReport:
     llm_overview = None
     model_used = None
     fallback_used = False
+    fallback_reason = None
 
     try:
         summary_prompt = _build_llm_architecture_prompt(
@@ -113,9 +116,15 @@ def analyze_codebase_architecture(payload: GraphPayload) -> ArchitectureReport:
             ),
         )
         if llm_res and llm_res.get("content"):
-            llm_overview = llm_res["content"].strip()
-            model_used = llm_res.get("model")
-            fallback_used = llm_res.get("fallback_used", False)
+            candidate_model = llm_res.get("model")
+            # The local router fallback is generic canned text, not a summary of
+            # this repository. Use the AST-derived overview instead.
+            if candidate_model != "architex-local-engine":
+                llm_overview = llm_res["content"].strip()
+                model_used = candidate_model
+                fallback_used = llm_res.get("fallback_used", False)
+            else:
+                fallback_used = True
     except Exception as exc:
         logger.info("LLM architecture generation unavailable (%s). Using deterministic overview.", exc)
         fallback_used = True
@@ -201,25 +210,6 @@ def generate_onboarding_documentation(payload: GraphPayload) -> OnboardingDocRes
         dependents = ", ".join(fr.dependents)[:40] or "None (Root/Entry)"
         md_lines.append(f"| `{fr.file_path}` | {fr.role} | {symbols} | {dependents} |")
 
-    md_lines.extend([
-        "",
-        "## 5. Getting Started & Developer Workflow",
-        "### Local Setup",
-        "```bash",
-        "# Clone and set up environment",
-        "git clone <repo-url>",
-        "cd <repo-folder>",
-        "python3 -m venv .venv",
-        "source .venv/bin/activate",
-        "pip install -r requirements.txt",
-        "```",
-        "",
-        "### Architecture Integrity Guidelines",
-        "- **Separation of Concerns:** Keep API endpoints focused on validation and transport, and delegate domain logic to services.",
-        "- **Explicit Imports:** Avoid circular dependencies between service modules.",
-        "- **Data Integrity:** Ensure file modifications and state transitions are logged in persistence stores.",
-    ])
-
     return OnboardingDocResponse(
         title=f"{report.project_name} Onboarding Guide",
         markdown="\n".join(md_lines),
@@ -272,17 +262,30 @@ def answer_codebase_question(payload: GraphPayload, question: str) -> CodebaseQn
             f"CODEBASE CONTEXT:\n{context_str}\n\n"
             f"Provide a clear, detailed explanation with code references and data flow where relevant."
         )
-        llm_res = generate_completion(
+        llm_res = route_and_generate(
             q_prompt,
             system="You are an expert AI code assistant analyzing a Python codebase.",
+            task_type=TaskType.EXPLANATION,
+            override_model=get_codebase_qa_model(),
         )
-        if llm_res and llm_res.get("content"):
-            llm_answer = llm_res["content"].strip()
-            model_used = llm_res.get("model")
-            fallback_used = llm_res.get("fallback_used", False)
+        if llm_res and llm_res.content:
+            model_used = llm_res.model
+            fallback_used = llm_res.fallback_used
+            fallback_reason = llm_res.fallback_reason
+            # The router's generic local response is not codebase-aware. Build a
+            # grounded answer from the parsed project instead of presenting it
+            # as if it had answered the question.
+            if model_used != "architex-local-engine":
+                llm_answer = llm_res.content.strip()
     except Exception as exc:
         logger.info("LLM Q&A unavailable (%s). Using deterministic answer engine.", exc)
         fallback_used = True
+        model_used = "architex-local-engine"
+        error_detail = str(exc).strip() or type(exc).__name__
+        configured_key = os.getenv("GEMINI_API_KEY", "")
+        if configured_key:
+            error_detail = error_detail.replace(configured_key, "[redacted]")
+        fallback_reason = f"Gemini request failed: {error_detail[:240]}"
 
     # 4. Fallback deterministic answer
     if not llm_answer:
@@ -301,6 +304,7 @@ def answer_codebase_question(payload: GraphPayload, question: str) -> CodebaseQn
         relevant_symbols=relevant_symbols,
         model_used=model_used,
         fallback_used=fallback_used,
+        fallback_reason=fallback_reason,
     )
 
 
@@ -646,23 +650,32 @@ def _generate_deterministic_overview(
     files_map: dict[str, Any],
     data_flow: list[DataFlowStep],
 ) -> str:
-    tech_str = ", ".join(key_technologies) if key_technologies else "standard Python libraries"
     total_files = len(files_map)
     total_classes = sum(len(f.get("classes", [])) for f in files_map.values())
     total_funcs = sum(len(f.get("functions", [])) for f in files_map.values())
+    tech_str = ", ".join(key_technologies) if key_technologies else "No external frameworks were identified from the scanned imports"
 
-    flow_desc = " ➔ ".join(step.stage for step in data_flow) if data_flow else "Input ➔ Processing ➔ Output"
+    representative_files = []
+    for path, info in list(files_map.items())[:5]:
+        symbols = [*info.get("classes", []), *info.get("functions", [])]
+        summary = f" (`{', '.join(symbols[:4])}`)" if symbols else ""
+        docstring = (info.get("docstring") or "").strip().splitlines()
+        purpose = f" — {docstring[0]}" if docstring else ""
+        representative_files.append(f"- `{path}`{summary}{purpose}")
 
-    return (
-        f"**{project_name}** is built upon a **{arch_pattern}**, comprising {total_files} modules, "
-        f"{total_classes} classes, and {total_funcs} functional definitions. "
-        f"The application harnesses {tech_str} to structure its operational capabilities.\n\n"
-        f"Control flow enters through defined API entry points, where payloads are parsed, "
-        f"validated, and mapped into AST dependency structures. Domain services then perform "
-        f"static analysis, debt categorization, and AI routing. Finally, state changes and "
-        f"audit trails are coordinated through persistent ledger operations.\n\n"
-        f"**Core Data Lifecycle:** `{flow_desc}`."
-    )
+    sections = [
+        f"**{project_name}** contains {total_files} scanned Python files, {total_classes} classes, and {total_funcs} top-level functions. "
+        f"Its file layout and import relationships most closely match a **{arch_pattern}** structure.",
+        f"Detected technologies from imports: {tech_str}.",
+    ]
+    if representative_files:
+        sections.append("Files and symbols found in the repository:\n" + "\n".join(representative_files))
+    if data_flow:
+        flow_desc = " → ".join(step.stage for step in data_flow[:5])
+        sections.append(f"The extracted dependency graph suggests this flow: `{flow_desc}`. This is inferred from file relationships, not runtime tracing.")
+    else:
+        sections.append("No cross-file data flow could be inferred from the scanned import relationships.")
+    return "\n\n".join(sections)
 
 
 def _find_relevant_context(
@@ -736,6 +749,10 @@ def _build_deterministic_answer(
             lines.append(f"- **Key Functions:** {', '.join(f'`{fn}`' for fn in funcs[:5])}")
         if deps:
             lines.append(f"- **Internal Dependencies:** {', '.join(f'`{d}`' for d in list(deps)[:4])}")
+        source = info.get("source", "")
+        source_summary = _summarize_source(source)
+        if source_summary:
+            lines.append(f"- **What the source does:** {source_summary}")
         lines.append("")
 
     if relevant_symbols:
@@ -746,4 +763,42 @@ def _build_deterministic_answer(
         "To explore how these symbols connect visually, select the corresponding nodes in the Knowledge Graph canvas."
     )
     return "\n".join(lines)
+
+
+def _summarize_source(source: str) -> str:
+    """Summarize concrete module contents for the offline Q&A fallback."""
+    if not source.strip():
+        return ""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        meaningful = [line.strip() for line in source.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+        return "Source preview: " + " · ".join(meaningful[:3])[:360] if meaningful else ""
+
+    imports: list[str] = []
+    symbols: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imports.append(node.module or "relative module")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            doc = ast.get_docstring(node)
+            detail = f" — {doc.splitlines()[0]}" if doc else ""
+            symbols.append(f"`{node.name}()`{detail}")
+        elif isinstance(node, ast.ClassDef):
+            doc = ast.get_docstring(node)
+            detail = f" — {doc.splitlines()[0]}" if doc else ""
+            symbols.append(f"class `{node.name}`{detail}")
+
+    parts: list[str] = []
+    if symbols:
+        parts.append("defines " + "; ".join(symbols[:6]))
+    if imports:
+        parts.append("imports " + ", ".join(dict.fromkeys(imports[:6])))
+    if not parts:
+        top_level = [type(node).__name__.replace("Expr", "expression") for node in tree.body[:4]]
+        if top_level:
+            parts.append("contains " + ", ".join(top_level))
+    return "; ".join(parts)
 

@@ -104,6 +104,11 @@ export default function ArchitectureView({
                     <Sparkles size={11} /> {report.model_used}
                   </span>
                 )}
+                {report.fallback_used && !report.model_used && (
+                  <span className="arch-ai-tag" title="Generated from scanned files and dependency relationships">
+                    <FileCode size={11} /> Code-derived summary
+                  </span>
+                )}
               </div>
               <div className="arch-overview-text">
                 <MarkdownRenderer content={report.system_overview} compact />

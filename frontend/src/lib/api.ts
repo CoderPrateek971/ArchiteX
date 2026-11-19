@@ -53,6 +53,20 @@ export async function cloneRepo(url: string, branch?: string): Promise<GraphPayl
   return data;
 }
 
+export async function downloadUpdatedWorkspace(workspaceId: string): Promise<void> {
+  const { data } = await api.get<Blob>(`/api/workspace/${encodeURIComponent(workspaceId)}/download`, {
+    responseType: "blob",
+  });
+  const url = URL.createObjectURL(data);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "architex-updated-project.zip";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export async function analyzeDebt(graph: GraphPayload): Promise<DebtReport> {
   const { data } = await api.post<DebtReport>("/api/analyze-debt", graph);
   return data;

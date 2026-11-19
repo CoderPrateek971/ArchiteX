@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   AlertTriangle,
   History,
@@ -15,9 +15,14 @@ import {
   RotateCcw,
   BookOpen,
   MessageSquare,
-  Layers,
   X,
   Box,
+  ArrowRight,
+  Sun,
+  Moon,
+  MoreHorizontal,
+  Download,
+  FolderOpen,
 } from "lucide-react";
 
 import ArchitectureCanvas from "./components/ArchitectureCanvas";
@@ -31,6 +36,7 @@ import {
   analyzeDebt,
   cloneRepo,
   deleteWorkspace,
+  downloadUpdatedWorkspace,
   errorMessage,
   applyAutomaticRepair,
   explainArchitecture,
@@ -41,6 +47,7 @@ import {
 import type {
   ArchitectureReport,
   DebtFinding,
+  LedgerEntry,
   GraphNode,
   GraphPayload,
   OnboardingDocResponse,
@@ -49,8 +56,71 @@ import type {
 
 const TABS: Severity[] = ["High", "Medium", "Low"];
 
+type WritableFile = {
+  getFile(): Promise<File>;
+  createWritable(): Promise<{ write(contents: string): Promise<void>; close(): Promise<void> }>;
+};
+
+type SourceDirectory = {
+  name: string;
+  getDirectoryHandle(name: string, options?: { create?: boolean }): Promise<SourceDirectory>;
+  getFileHandle(name: string, options?: { create?: boolean }): Promise<WritableFile>;
+  queryPermission?(options: { mode: "readwrite" }): Promise<PermissionState>;
+  requestPermission?(options: { mode: "readwrite" }): Promise<PermissionState>;
+};
+
+type DirectoryPickerWindow = Window & {
+  showDirectoryPicker?: (options: { mode: "readwrite" }) => Promise<SourceDirectory>;
+};
+
+async function writeLinkedSourceFile(
+  root: SourceDirectory,
+  relativePath: string,
+  expectedOriginal: string,
+  updatedCode: string
+): Promise<void> {
+  const parts = relativePath.replace(/\\/g, "/").split("/").filter(Boolean);
+  if (!parts.length || parts.some((part) => part === "." || part === "..")) {
+    throw new Error("The target file path is not safe to write.");
+  }
+
+  let directory = root;
+  for (const part of parts.slice(0, -1)) {
+    directory = await directory.getDirectoryHandle(part);
+  }
+  const target = await directory.getFileHandle(parts[parts.length - 1]);
+  const current = await (await target.getFile()).text();
+  const normalize = (code: string) => code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (normalize(current) !== normalize(expectedOriginal)) {
+    throw new Error(`The linked folder's ${relativePath} differs from the uploaded ZIP. No local file was overwritten.`);
+  }
+
+  const writable = await target.createWritable();
+  await writable.write(updatedCode);
+  await writable.close();
+}
+
+function getFindingKey(finding: DebtFinding): string {
+  return finding.id || [
+    finding.file_name,
+    finding.line_number ?? "no-line",
+    finding.category ?? "uncategorized",
+    finding.title ?? finding.description,
+  ].join(":");
+}
+
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const resizeStartRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const savedWidth = Number(localStorage.getItem("architex-sidebar-width"));
+    return Number.isFinite(savedWidth) && savedWidth >= 360 ? Math.min(savedWidth, 880) : 480;
+  });
+  const [sidebarResizing, setSidebarResizing] = useState(false);
+  const [experience, setExperience] = useState<"debt" | "explain" | null>(null);
+  const [theme, setTheme] = useState<"dark" | "light">(() =>
+    localStorage.getItem("architex-theme") === "light" ? "light" : "dark"
+  );
   const [dragOver, setDragOver] = useState(false);
   const [sourceMode, setSourceMode] = useState<"zip" | "git">("zip");
   const [gitUrl, setGitUrl] = useState("");
@@ -66,12 +136,15 @@ export default function App() {
   const [routerOpen, setRouterOpen] = useState(false);
   const [ledgerRefresh, setLedgerRefresh] = useState(0);
   const [uploading, setUploading] = useState(false);
+  const [exportingWorkspace, setExportingWorkspace] = useState(false);
+  const [linkedSourceDirectory, setLinkedSourceDirectory] = useState<SourceDirectory | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [autoSolvingId, setAutoSolvingId] = useState<string | null>(null);
+  const [autoSolveFeedback, setAutoSolveFeedback] = useState<{ key: string; message: string } | null>(null);
+  const [repairNotice, setRepairNotice] = useState<string | null>(null);
 
   // Architecture & Onboarding & Chat States
-  const [sidebarMode, setSidebarMode] = useState<"debt" | "architecture">("debt");
   const [archReport, setArchReport] = useState<ArchitectureReport | null>(null);
   const [loadingArch, setLoadingArch] = useState(false);
   const [onboardingOpen, setOnboardingOpen] = useState(false);
@@ -82,13 +155,85 @@ export default function App() {
 
   const counts = useMemo(() => {
     return {
-      High: findings.filter((f) => f.severity === "High").length,
-      Medium: findings.filter((f) => f.severity === "Medium").length,
-      Low: findings.filter((f) => f.severity === "Low").length,
+      High: findings.filter((f) => f.severity.trim().toLowerCase() === "high").length,
+      Medium: findings.filter((f) => f.severity.trim().toLowerCase() === "medium").length,
+      Low: findings.filter((f) => f.severity.trim().toLowerCase() === "low").length,
     };
   }, [findings]);
 
-  const visibleFindings = findings.filter((f) => f.severity === tab);
+  const visibleFindings = findings.filter(
+    (finding) => finding.severity.trim().toLowerCase() === tab.toLowerCase()
+  );
+
+  useEffect(() => {
+    localStorage.setItem("architex-theme", theme);
+  }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem("architex-sidebar-width", String(sidebarWidth));
+  }, [sidebarWidth]);
+
+  const themeToggle = (
+    <button
+      type="button"
+      className="theme-toggle"
+      onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
+      aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+      title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+    >
+      {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+      <span>{theme === "dark" ? "Light" : "Dark"}</span>
+    </button>
+  );
+
+  if (!experience) {
+    return (
+      <main className={`experience-home ${theme === "light" ? "theme-light" : ""}`}>
+        <div className="experience-home-inner">
+          <header className="experience-header">
+            <div className="experience-brand">
+              <span className="brand-icon"><Workflow size={22} /></span>
+              <div>
+              <h1>ArchiteX</h1>
+                <p>Python project tools</p>
+              </div>
+            </div>
+            {themeToggle}
+          </header>
+          <div className="experience-intro">
+            <h2>Choose a tool</h2>
+            <p>Start with the task you want to complete.</p>
+          </div>
+          <div className="experience-options">
+            <button
+              type="button"
+              className="experience-card"
+              onClick={() => setExperience("debt")}
+            >
+              <span className="experience-icon debt"><ShieldAlert size={23} /></span>
+              <span className="experience-card-copy">
+                <strong>Debt Detector</strong>
+                <span>Find bugs, code smells, and technical debt. Review severity, evidence, and repair guidance.</span>
+              </span>
+              <ArrowRight className="experience-arrow" size={19} />
+            </button>
+            <button
+              type="button"
+              className="experience-card"
+              onClick={() => setExperience("explain")}
+            >
+              <span className="experience-icon explain"><BookOpen size={23} /></span>
+              <span className="experience-card-copy">
+                <strong>Codebase Explanation</strong>
+                <span>Explore the knowledge graph, architecture, file responsibilities, and data flow.</span>
+              </span>
+              <ArrowRight className="experience-arrow" size={19} />
+            </button>
+          </div>
+        </div>
+      </main>
+    );
+  }
 
   async function processIngestedGraph(nextGraph: GraphPayload, label: string) {
     setGraph(nextGraph);
@@ -143,6 +288,7 @@ export default function App() {
 
     setError(null);
     setUploading(true);
+    setLinkedSourceDirectory(null);
     setFindings([]);
     setSelectedPath(null);
     setActiveFinding(null);
@@ -158,6 +304,55 @@ export default function App() {
     }
   }
 
+async function verifyLinkedSourceFile(
+  root: SourceDirectory,
+  relativePath: string,
+  expectedOriginal: string
+): Promise<void> {
+  const parts = relativePath.replace(/\\/g, "/").split("/").filter(Boolean);
+  if (!parts.length || parts.some((part) => part === "." || part === "..")) {
+    throw new Error("The target file path is not safe to read.");
+  }
+  let directory = root;
+  try {
+    for (const part of parts.slice(0, -1)) directory = await directory.getDirectoryHandle(part);
+    const target = await directory.getFileHandle(parts[parts.length - 1]);
+    const current = await (await target.getFile()).text();
+    const normalize = (code: string) => code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (normalize(current) !== normalize(expectedOriginal)) {
+      throw new Error(`${relativePath} has changed since ${fileName || "the ZIP"} was uploaded. No local changes were overwritten. Link another folder or upload the latest project ZIP.`);
+    }
+  } catch (err) {
+    if (err instanceof Error && (err.message.includes("has changed since") || err.message.includes("folder access"))) throw err;
+    if (err instanceof DOMException && err.name === "NotAllowedError") {
+      throw new Error("Chrome blocked access to this folder. Reset file access for localhost:3000 in Site settings, reload, and link the folder again.");
+    }
+    throw new Error(`Could not find ${relativePath} in the selected folder. Choose the extracted ${fileName || "project"} folder.`);
+  }
+}
+
+async function ensureDirectoryWriteAccess(directory: SourceDirectory): Promise<void> {
+  const options = { mode: "readwrite" as const };
+  if (await directory.queryPermission?.(options) === "granted") return;
+  const permission = await directory.requestPermission?.(options);
+  if (permission !== "granted") {
+    throw new Error("Chrome denied write access. Reset file access for localhost:3000 in Site settings, reload the page, then link the project folder again.");
+  }
+}
+
+async function linkedFileExists(root: SourceDirectory, relativePath: string): Promise<boolean> {
+  const parts = relativePath.replace(/\\/g, "/").split("/").filter(Boolean);
+  if (!parts.length || parts.some((part) => part === "." || part === "..")) return false;
+  try {
+    let directory = root;
+    for (const part of parts.slice(0, -1)) directory = await directory.getDirectoryHandle(part);
+    await directory.getFileHandle(parts[parts.length - 1]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
   async function handleGitClone(e: React.FormEvent) {
     e.preventDefault();
     const cleanUrl = gitUrl.trim();
@@ -168,6 +363,7 @@ export default function App() {
 
     setError(null);
     setUploading(true);
+    setLinkedSourceDirectory(null);
     setFindings([]);
     setSelectedPath(null);
     setActiveFinding(null);
@@ -200,7 +396,7 @@ export default function App() {
     setArchReport(null);
     setOnboardingDoc(null);
     setOnboardingError(null);
-    setSidebarMode("debt");
+    setLinkedSourceDirectory(null);
 
     if (inputRef.current) {
       inputRef.current.value = "";
@@ -246,46 +442,240 @@ export default function App() {
     }
   };
 
+  const handleDownloadUpdatedWorkspace = async () => {
+    if (!graph?.workspace_id) {
+      setError("This project has no downloadable workspace. Re-upload the ZIP or clone the repository, then retry.");
+      return;
+    }
+    setExportingWorkspace(true);
+    setError(null);
+    try {
+      await downloadUpdatedWorkspace(graph.workspace_id);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setExportingWorkspace(false);
+    }
+  };
+
+  const handleLinkSourceDirectory = async () => {
+    const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
+    if (!picker) {
+      setError("Direct folder updates require Chrome or Edge. You can still download the updated project ZIP.");
+      return;
+    }
+    try {
+      const directory = await picker({ mode: "readwrite" });
+      await ensureDirectoryWriteAccess(directory);
+      const candidates = Object.entries(graph?.file_map || {}).filter(([path]) => path.endsWith(".py"));
+      const missingFiles: string[] = [];
+      for (const [path] of candidates) {
+        if (!(await linkedFileExists(directory, path))) missingFiles.push(path);
+      }
+      if (missingFiles.length > 0) {
+        setError(`This folder is missing ${missingFiles.slice(0, 3).join(", ")}. Choose the extracted ${fileName || "project"} folder that directly contains the uploaded project files.`);
+        return;
+      }
+      setLinkedSourceDirectory(directory);
+      setError(null);
+      setAutoSolveFeedback(null);
+      setRepairNotice(null);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      setError(errorMessage(err));
+    }
+  };
+
+  async function chooseSourceDirectoryForRepair(): Promise<SourceDirectory | null> {
+    if (linkedSourceDirectory) {
+      try {
+        await ensureDirectoryWriteAccess(linkedSourceDirectory);
+        return linkedSourceDirectory;
+      } catch (err) {
+        setError(errorMessage(err));
+        return null;
+      }
+    }
+    const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
+    if (!picker) return null;
+    try {
+      const directory = await picker({ mode: "readwrite" });
+      await ensureDirectoryWriteAccess(directory);
+      setError(null);
+      return directory;
+    } catch (err) {
+      // The user may cancel the picker and still choose to save the workspace fix.
+      if (err instanceof DOMException && err.name === "AbortError") return null;
+      setError(errorMessage(err));
+      return null;
+    }
+  }
+
   // Handle AI Auto-Solving for Low Severity Issues using Module 6 Repair Engine
   const handleAutoSolve = async (finding: DebtFinding) => {
     const cleanFileName = finding.file_name.replace(/^file:/, "");
-    const findingKey = `${finding.file_name}-${finding.line_number ?? 0}`;
+    const findingKey = getFindingKey(finding);
+    const originalCode = graph?.file_map?.[cleanFileName];
+    const proposedCode = finding.proposed_code || finding.structured_plan?.proposed_code || "";
+    const renameFrom = finding.title.match(/Function [`']?([A-Za-z_]\w*)/)?.[1];
+    const renameTo = proposedCode.match(/^\s*def\s+([A-Za-z_]\w*)\s*\(/m)?.[1];
+    const isFunctionRename = Boolean(
+      finding.title.includes("Weak or Non-Descriptive Naming") && renameFrom && renameTo && renameFrom !== renameTo
+    );
+    setAutoSolveFeedback(null);
+    setRepairNotice(null);
+    if (!proposedCode || (originalCode !== undefined && proposedCode === originalCode)) {
+      setAutoSolveFeedback({ key: findingKey, message: "No safe automatic patch is available for this finding yet." });
+      return;
+    }
     setAutoSolvingId(findingKey);
 
-    const proposedCode =
-      finding.proposed_code ||
-      (finding.structured_plan ? finding.structured_plan.proposed_code : "") ||
-      `# [ArchiteX Auto-Solve] Resolved ${finding.title || "Low severity debt"}\n`;
-
     try {
+      // ZIP uploads are isolated from the user's disk. Ask for the extracted
+      // project folder during this click so the same fix can also be written
+      // back to its matching local file.
+      const sourceDirectory = await chooseSourceDirectoryForRepair();
+      if (!sourceDirectory) {
+        setAutoSolveFeedback({
+          key: findingKey,
+          message: "Folder access was not granted, so the fix was not applied. Click Link another folder and choose the extracted project folder. If Chrome keeps denying access, reset file access for localhost:3000 in Site settings, reload, and try again.",
+        });
+        return;
+      }
+      if (sourceDirectory && originalCode !== undefined) {
+        try {
+          const filesToCheck: Array<[string, string]> = isFunctionRename
+            ? Object.entries(graph?.file_map || {}).filter(([path]) => path.endsWith(".py"))
+            : [[cleanFileName, originalCode] as [string, string]];
+          for (const [path, contents] of filesToCheck) {
+            await verifyLinkedSourceFile(sourceDirectory, path, contents);
+          }
+        } catch (verifyError) {
+          setLinkedSourceDirectory(null);
+          setAutoSolveFeedback({
+            key: findingKey,
+            message: verifyError instanceof Error ? verifyError.message : "The selected folder does not contain the original project file.",
+          });
+          return;
+        }
+        setLinkedSourceDirectory(sourceDirectory);
+      } else {
+        setAutoSolveFeedback({ key: findingKey, message: `Could not read ${cleanFileName} from the uploaded project. Re-upload the ZIP and retry.` });
+        return;
+      }
       const res = await applyAutomaticRepair({
         issue_id: finding.id || `ISSUE-${cleanFileName}-${finding.line_number ?? 0}`,
+        issue_title: finding.title || null,
+        issue_description: finding.description || null,
         file_path: cleanFileName,
         severity: finding.severity,
         proposed_code: proposedCode,
-        workspace_root: graph?.repo_root,
+        workspace_id: graph?.workspace_id,
+        ...(isFunctionRename ? { rename_symbol_from: renameFrom, rename_symbol_to: renameTo } : {}),
         approval: true,
+        expected_original_code: originalCode,
       });
 
       if (res.success) {
-        // Remove the solved issue from the list
-        setFindings((prev) =>
-          prev.filter((f) => !(f.file_name === finding.file_name && f.line_number === finding.line_number))
+        const updatedFiles = res.updated_files && Object.keys(res.updated_files).length > 0
+          ? res.updated_files
+          : { [cleanFileName]: proposedCode };
+        let localWritebackMessage = "Download the updated project ZIP to save the changed project files.";
+        if (sourceDirectory && originalCode !== undefined) {
+          try {
+            for (const [path, code] of Object.entries(updatedFiles)) {
+              const previousCode = graph?.file_map?.[path];
+              if (previousCode === undefined) throw new Error(`Could not verify ${path} against the uploaded project.`);
+              await writeLinkedSourceFile(sourceDirectory, path, previousCode, code);
+            }
+            localWritebackMessage = `Updated ${Object.keys(updatedFiles).length} file(s) in ${sourceDirectory.name}.`;
+          } catch (writeError) {
+            localWritebackMessage = writeError instanceof Error
+              ? `${writeError.message} The ArchiteX workspace still has the fix; download the updated project ZIP to retrieve it.`
+              : "The fix is saved in the ArchiteX workspace, but local folder write-back failed. Download the updated project ZIP to retrieve it.";
+          }
+        }
+        // Remove only this issue; multiple findings can share a file and line.
+        setFindings((prev) => prev.filter((f) => getFindingKey(f) !== findingKey));
+        setGraph((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            file_map: { ...prev.file_map, ...updatedFiles },
+            nodes: prev.nodes.map((node) => {
+              const nodePath = String(node.data.path || "").replace(/^file:/, "");
+              const kind = node.data.kind || node.type;
+              return kind === "file" && updatedFiles[nodePath]
+                ? { ...node, data: { ...node.data, source: updatedFiles[nodePath] } }
+                : node;
+            }),
+          };
+        });
+        setAutoSolveFeedback(null);
+        setRepairNotice(
+          `Fix saved to the ArchiteX workspace${res.change_id ? ` as change #${res.change_id}` : ""}. ${localWritebackMessage}`
         );
         setLedgerRefresh((prev) => prev + 1);
       } else {
-        alert(`Automatic repair rejected or failed:\n${res.explanation}`);
+        setAutoSolveFeedback({ key: findingKey, message: res.explanation || "The repair could not be applied." });
       }
     } catch (err) {
       console.error(err);
-      alert(`Failed to apply repair: ${errorMessage(err)}`);
+      setAutoSolveFeedback({ key: findingKey, message: errorMessage(err) });
     } finally {
       setAutoSolvingId(null);
     }
   };
 
+  const handleLedgerRollback = async (entry: LedgerEntry): Promise<string> => {
+    const currentGraph = graph;
+    const repoRoot = currentGraph?.repo_root?.replace(/\\/g, "/").replace(/\/$/, "");
+    const filePath = entry.file_path.replace(/^file:/, "").replace(/\\/g, "/");
+    if (!currentGraph || !repoRoot || !filePath.startsWith(`${repoRoot}/`)) {
+      return "Rollback completed in the ArchiteX workspace. This change belongs to a different upload, so the currently linked VS Code folder was left unchanged.";
+    }
+
+    const relativePath = filePath.slice(repoRoot.length + 1);
+    const restoredCode = entry.previous_code;
+    const updatedGraph: GraphPayload = {
+      ...currentGraph,
+      file_map: { ...currentGraph.file_map, [relativePath]: restoredCode },
+      nodes: currentGraph.nodes.map((node) => {
+        const nodePath = String(node.data.path || "").replace(/^file:/, "").replace(/\\/g, "/");
+        const kind = node.data.kind || node.type;
+        return kind === "file" && nodePath === relativePath
+          ? { ...node, data: { ...node.data, source: restoredCode } }
+          : node;
+      }),
+    };
+    setGraph(updatedGraph);
+
+    let sourceMessage = "";
+    if (linkedSourceDirectory) {
+      try {
+        await writeLinkedSourceFile(linkedSourceDirectory, relativePath, entry.new_code, restoredCode);
+        sourceMessage = ` VS Code folder updated: ${relativePath}.`;
+      } catch (err) {
+        sourceMessage = ` The ArchiteX workspace was rolled back, but the linked folder could not be updated: ${errorMessage(err)}`;
+      }
+    } else {
+      sourceMessage = " VS Code was not updated because no source folder is linked. Click Link source folder and select the extracted project folder to enable write-back.";
+    }
+
+    try {
+      const report = await analyzeDebt(updatedGraph);
+      setFindings(report.findings || []);
+    } catch {
+      // Keep the restored graph visible even if re-analysis is temporarily unavailable.
+    }
+    return `Change #${entry.id} rolled back in the ArchiteX workspace.${sourceMessage}`;
+  };
+
   return (
-    <div className="app-container">
+      <div
+        className={`app-container ${theme === "light" ? "theme-light" : ""} ${sidebarResizing ? "sidebar-resizing" : ""}`}
+        style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+      >
       {/* Left Sidebar */}
       <aside className="sidebar">
         {/* Header */}
@@ -296,60 +686,62 @@ export default function App() {
             </span>
             <div>
               <h1 className="brand-title">ArchiteX</h1>
-              <p className="brand-subtitle">AI Architecture Intelligence</p>
+              <p className="brand-subtitle">Python project tools</p>
             </div>
           </div>
           <div className="header-actions">
-            <button
-              type="button"
-              onClick={() => setRouterOpen(true)}
-              className="header-action-btn"
-              title="Multi-Model AI Router Hub & Arena"
-              aria-label="Open AI Router Hub"
-            >
-              <Cpu size={18} />
-            </button>
-            {graph && (
-              <>
-                <button
-                  type="button"
-                  onClick={() => void handleReset()}
-                  className="header-action-btn danger"
-                  title="Reset repository and clear graph"
-                  aria-label="Reset repository"
-                >
-                  <RotateCcw size={16} />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setChatOpen(true)}
-                  className="header-action-btn"
-                  title="Ask Codebase Questions (Q&A)"
-                  aria-label="Ask Codebase Questions"
-                >
-                  <MessageSquare size={16} />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleOpenOnboarding()}
-                  className="header-action-btn"
-                  title="Developer Onboarding Documentation"
-                  aria-label="Developer Onboarding Documentation"
-                >
-                  <BookOpen size={16} />
-                </button>
-              </>
+            {themeToggle}
+            {(experience === "debt" || (experience === "explain" && graph)) && (
+              <details className="workspace-menu">
+                <summary className="workspace-menu-trigger"><MoreHorizontal size={17} /><span>Tools</span></summary>
+                <div className="workspace-menu-list">
+                  {experience === "debt" && (
+                    <>
+                      <button type="button" onClick={(event) => { event.currentTarget.closest("details")?.removeAttribute("open"); setRouterOpen(true); }}>
+                        <Cpu size={15} /> Model router
+                      </button>
+                      <button type="button" onClick={(event) => { event.currentTarget.closest("details")?.removeAttribute("open"); setLedgerOpen(true); }}>
+                        <History size={15} /> Change history
+                      </button>
+                    </>
+                  )}
+                  {experience === "explain" && graph && (
+                    <>
+                      <button type="button" onClick={(event) => { event.currentTarget.closest("details")?.removeAttribute("open"); setChatOpen(true); }}>
+                        <MessageSquare size={15} /> Ask about this codebase
+                      </button>
+                      <button type="button" onClick={(event) => { event.currentTarget.closest("details")?.removeAttribute("open"); void handleOpenOnboarding(); }}>
+                        <BookOpen size={15} /> Onboarding guide
+                      </button>
+                    </>
+                  )}
+                </div>
+              </details>
             )}
+          </div>
+        </div>
+
+        <div className="sidebar-scroll-content">
+        <div className="tool-switch-bar">
+          <span className="active-tool-label">
+            <Workflow size={14} />
+            {experience === "debt" ? "Debt Detector" : "Codebase Explanation"}
+          </span>
+          {experience === "debt" && (
             <button
               type="button"
+              className="rollback-primary-button"
               onClick={() => setLedgerOpen(true)}
-              className="header-action-btn"
-              title="Open Smart Ledger History"
-              aria-label="Open history ledger"
+              title="Open change history and selectively rollback a saved change"
             >
-              <History size={18} />
+              <RotateCcw size={14} />
+              <span>Rollback</span>
             </button>
-          </div>
+          )}
+          <button type="button" className="tool-switch-button" onClick={() => setExperience(null)}>
+            <span>Change tool</span>
+            <ArrowRight size={14} />
+          </button>
         </div>
 
         {/* Upload Zone */}
@@ -540,30 +932,8 @@ export default function App() {
           )}
         </div>
 
-        {/* Sidebar Mode Navigation: Debt Triage vs Architecture Intelligence */}
-        {graph && (
-          <div className="sidebar-mode-tabs">
-            <button
-              type="button"
-              className={`sidebar-mode-tab ${sidebarMode === "debt" ? "active" : ""}`}
-              onClick={() => setSidebarMode("debt")}
-            >
-              <ShieldAlert size={13} />
-              <span>Debt Triage ({findings.length})</span>
-            </button>
-            <button
-              type="button"
-              className={`sidebar-mode-tab ${sidebarMode === "architecture" ? "active" : ""}`}
-              onClick={() => setSidebarMode("architecture")}
-            >
-              <Layers size={13} />
-              <span>Architecture & Flow</span>
-            </button>
-          </div>
-        )}
-
         {/* VIEW 1: ARCHITECTURE INTELLIGENCE */}
-        {graph && sidebarMode === "architecture" && (
+        {experience === "explain" && (
           <div className="architecture-panel-wrapper">
             <ArchitectureView
               report={archReport}
@@ -575,7 +945,7 @@ export default function App() {
         )}
 
         {/* VIEW 2: DEBT TRIAGE */}
-        {(!graph || sidebarMode === "debt") && (
+        {experience === "debt" && (
           <div className="triage-section">
             <div className="section-label">
               <span>Technical Debt Triage</span>
@@ -586,6 +956,8 @@ export default function App() {
               )}
             </div>
 
+            {repairNotice && <div className="repair-notice" role="status">{repairNotice}</div>}
+
             {/* Severity Tabs */}
             <div className="tabs-container">
               {TABS.map((t) => (
@@ -593,6 +965,8 @@ export default function App() {
                   key={t}
                   type="button"
                   className={`tab-btn ${tab === t ? "active" : ""}`}
+                  data-severity={t}
+                  aria-pressed={tab === t}
                   onClick={() => setTab(t)}
                 >
                   <span className={`tab-dot tab-dot-${t.toLowerCase()}`} />
@@ -625,12 +999,15 @@ export default function App() {
     </div>
   )}
 
-  {visibleFindings.map((finding, idx) => {
+  {visibleFindings.map((finding) => {
     const cleanPath = finding.file_name.replace(/^file:/, "");
     const isSelected = selectedPath === finding.file_name;
-    const findingKey = `${finding.file_name}-${finding.line_number ?? idx}`;
+    const findingKey = getFindingKey(finding);
     const isSolvingThis = autoSolvingId === findingKey;
     const isLow = finding.severity === "Low";
+    const proposedFix = finding.proposed_code || finding.structured_plan?.proposed_code || "";
+    const originalCode = graph?.file_map?.[cleanPath];
+    const hasSafeAutoFix = Boolean(proposedFix && (originalCode === undefined || proposedFix !== originalCode));
 
     return (
       <div
@@ -686,14 +1063,16 @@ export default function App() {
 
                   {finding.root_cause && (
                     <div className="card-root-cause">
-                      <span className="root-cause-label">ROOT CAUSE:</span> {finding.root_cause}
+                      <span className="root-cause-label">Root cause</span>
+                      <span>{finding.root_cause}</span>
                     </div>
                   )}
 
                   {finding.code_evidence && (
-                    <div className="card-code-evidence">
+                    <details className="card-code-evidence" onClick={(event) => event.stopPropagation()}>
+                      <summary>View code evidence</summary>
                       <pre><code>{finding.code_evidence}</code></pre>
-                    </div>
+                    </details>
                   )}
 
                   {finding.potential_impact && (
@@ -719,17 +1098,17 @@ export default function App() {
                     {finding.severity === "Low" ? (
                       <div>
                         <p className="fix-preview-text">
-                          <strong style={{ color: "var(--emerald-400)" }}>AI Solution:</strong>{" "}
+                          <strong className="fix-preview-label">Suggested fix:</strong>{" "}
                           {finding.suggested_fix}
                         </p>
-                        <button
+                        {hasSafeAutoFix ? <button
                           type="button"
                           disabled={isSolvingThis}
                           onClick={(e) => {
                             e.stopPropagation();
                             void handleAutoSolve(finding);
                           }}
-                          className="btn-autosolve"
+                          className="btn-auto-solve"
                         >
                           {isSolvingThis ? (
                             <>
@@ -739,10 +1118,26 @@ export default function App() {
                           ) : (
                             <>
                               <Sparkles size={13} />
-                              <span>AI Auto-Solve</span>
+                              <span>Apply fix</span>
                             </>
                           )}
-                        </button>
+                        </button> : <p className="no-auto-fix">No safe automatic patch is available for this issue.</p>}
+                        {autoSolveFeedback?.key === findingKey && (
+                          <div className="auto-solve-feedback" role="status">
+                            <span>{autoSolveFeedback.message}</span>
+                            {(autoSolveFeedback.message.includes("has changed since") || autoSolveFeedback.message.includes("Could not find") || autoSolveFeedback.message.includes("Folder access was not granted")) && (
+                              <button
+                                type="button"
+                                className="feedback-link-button"
+                                onClick={() => {
+                                  void handleLinkSourceDirectory();
+                                }}
+                              >
+                                <FolderOpen size={13} /> Link another folder
+                              </button>
+                            )}
+                          </div>
+                        )}
                       </div>
                       ) : (
                         <div style={{ display: "flex", width: "100%", justifyContent: "flex-end" }}>
@@ -765,7 +1160,51 @@ export default function App() {
             </div>
           </div>
         )}
+        </div>
       </aside>
+
+      <div
+        className="sidebar-resizer"
+        title="Drag right to widen the sidebar; drag left to widen the graph"
+        role="separator"
+        aria-label="Resize sidebar"
+        aria-orientation="vertical"
+        aria-valuemin={360}
+        aria-valuemax={Math.min(880, Math.round(window.innerWidth * 0.72))}
+        aria-valuenow={sidebarWidth}
+        tabIndex={0}
+        onPointerDown={(event) => {
+          if (window.innerWidth <= 800) return;
+          event.preventDefault();
+          event.currentTarget.setPointerCapture(event.pointerId);
+          resizeStartRef.current = { startX: event.clientX, startWidth: sidebarWidth };
+          setSidebarResizing(true);
+        }}
+        onPointerMove={(event) => {
+          if (!resizeStartRef.current) return;
+          const maximum = Math.min(880, Math.round(window.innerWidth * 0.72));
+          const nextWidth = resizeStartRef.current.startWidth + event.clientX - resizeStartRef.current.startX;
+          setSidebarWidth(Math.max(360, Math.min(maximum, nextWidth)));
+        }}
+        onPointerUp={() => {
+          resizeStartRef.current = null;
+          setSidebarResizing(false);
+        }}
+        onPointerCancel={() => {
+          resizeStartRef.current = null;
+          setSidebarResizing(false);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+            event.preventDefault();
+            const maximum = Math.min(880, Math.round(window.innerWidth * 0.72));
+            const adjustment = event.key === "ArrowRight" ? 32 : -32;
+            setSidebarWidth((current) => Math.max(360, Math.min(maximum, current + adjustment)));
+          }
+        }}
+      >
+        <span className="sidebar-resizer-grip" />
+      </div>
 
       {/* Main Graph Area */}
       <main className="main-canvas-area">
@@ -782,24 +1221,49 @@ export default function App() {
         {/* Canvas Top Actions Bar (Reset, Ask Codebase, Onboarding) */}
         {graph && (
           <div className="canvas-top-actions">
+            {!graph.git_info && (
+              <button
+                type="button"
+                className="canvas-action-pill"
+                onClick={() => void handleLinkSourceDirectory()}
+                title="Select the original extracted project folder to write successful fixes back to it"
+              >
+                <FolderOpen size={13} />
+                <span>{linkedSourceDirectory ? `Linked: ${linkedSourceDirectory.name}` : "Link source folder"}</span>
+              </button>
+            )}
             <button
               type="button"
               className="canvas-action-pill"
-              onClick={() => setChatOpen(true)}
-              title="Ask questions about architecture, functions, files, data flow"
+              onClick={() => void handleDownloadUpdatedWorkspace()}
+              disabled={exportingWorkspace}
+              title="Download a ZIP containing your updated workspace files"
             >
-              <MessageSquare size={13} />
-              <span>Ask Codebase</span>
+              {exportingWorkspace ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+              <span>{exportingWorkspace ? "Preparing ZIP…" : "Download updated project"}</span>
             </button>
-            <button
-              type="button"
-              className="canvas-action-pill"
-              onClick={() => void handleOpenOnboarding()}
-              title="Generate comprehensive developer onboarding documentation"
-            >
-              <BookOpen size={13} />
-              <span>Onboarding Guide</span>
-            </button>
+            {experience === "explain" && (
+              <>
+                <button
+                  type="button"
+                  className="canvas-action-pill"
+                  onClick={() => setChatOpen(true)}
+                  title="Ask questions about architecture, functions, files, data flow"
+                >
+                  <MessageSquare size={13} />
+                  <span>Ask Codebase</span>
+                </button>
+                <button
+                  type="button"
+                  className="canvas-action-pill"
+                  onClick={() => void handleOpenOnboarding()}
+                  title="Generate comprehensive developer onboarding documentation"
+                >
+                  <BookOpen size={13} />
+                  <span>Onboarding Guide</span>
+                </button>
+              </>
+            )}
             <button
               type="button"
               className="canvas-action-pill danger"
@@ -925,7 +1389,8 @@ export default function App() {
           open={ledgerOpen}
           onClose={() => setLedgerOpen(false)}
           refreshKey={ledgerRefresh}
-          workspaceRoot={graph?.repo_root}
+          findings={findings}
+          onRollback={handleLedgerRollback}
         />
 
         {/* Multi-Model AI Router Hub */}
