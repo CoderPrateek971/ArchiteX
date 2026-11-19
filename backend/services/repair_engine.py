@@ -1,7 +1,9 @@
 import ast
 import hashlib
+import io
 import logging
 import os
+import tokenize
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -21,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 class RepairApplyRequest(BaseModel):
     issue_id: str = Field(..., min_length=1, description="ID of the issue or finding being resolved")
+    issue_title: Optional[str] = None
+    issue_description: Optional[str] = None
     file_path: str = Field(..., min_length=1, description="Target file path relative to workspace root")
     severity: str = Field(..., description="Severity of the issue (only 'low' is eligible for automatic repair)")
     proposed_code: str = Field(..., description="New Python source code proposed as the fix")
@@ -29,6 +33,8 @@ class RepairApplyRequest(BaseModel):
     approval: bool = Field(False, description="Explicit human or system approval to apply this automatic repair")
     original_code_hash: Optional[str] = Field(None, description="SHA-256 hash of original file code for concurrency check")
     expected_original_code: Optional[str] = Field(None, description="Exact expected original code for concurrency verification")
+    rename_symbol_from: Optional[str] = Field(None, description="Function identifier to rename throughout the Python workspace")
+    rename_symbol_to: Optional[str] = Field(None, description="Replacement function identifier")
 
 
 class RepairApplyResult(BaseModel):
@@ -42,6 +48,7 @@ class RepairApplyResult(BaseModel):
     explanation: str
     change_id: Optional[int] = None
     details: list[dict[str, Any]] = Field(default_factory=list)
+    updated_files: dict[str, str] = Field(default_factory=dict)
 
 
 def _normalize_code(code: str) -> str:
@@ -77,6 +84,137 @@ def _atomic_write(target_path: Path, content: str) -> None:
         raise
 
 
+def _rename_identifier_tokens(source: str, old_name: str, new_name: str) -> str:
+    """Rename Python NAME tokens while leaving comments and string literals untouched."""
+    lines = source.splitlines(keepends=True)
+    replacements: dict[int, list[tuple[int, int]]] = {}
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type == tokenize.NAME and token.string == old_name:
+            row, column = token.start
+            replacements.setdefault(row - 1, []).append((column, column + len(old_name)))
+    for row, spans in replacements.items():
+        for start, end in sorted(spans, reverse=True):
+            lines[row] = lines[row][:start] + new_name + lines[row][end:]
+    return "".join(lines)
+
+
+def _apply_workspace_rename(
+    *,
+    issue_id: str,
+    root: Path,
+    primary_path: Path,
+    old_name: str,
+    new_name: str,
+    expected_original_code: Optional[str],
+    severity: str,
+    issue_title: Optional[str] = None,
+    issue_description: Optional[str] = None,
+) -> RepairApplyResult:
+    if not old_name.isidentifier() or not new_name.isidentifier() or old_name == new_name:
+        raise ValueError("The requested function rename is invalid.")
+
+    skip_dirs = {".git", ".venv", "venv", "env", "__pycache__", "node_modules", "build", "dist", ".tox"}
+    originals: dict[Path, str] = {}
+    changes: dict[Path, str] = {}
+    primary_found = False
+
+    for file_path in root.rglob("*.py"):
+        relative = file_path.relative_to(root)
+        if any(part.lower() in skip_dirs for part in relative.parts[:-1]):
+            continue
+        try:
+            original = file_path.read_text(encoding="utf-8", errors="replace")
+            updated = _rename_identifier_tokens(original, old_name, new_name)
+        except (OSError, tokenize.TokenError, IndentationError) as exc:
+            if file_path.resolve() == primary_path.resolve():
+                raise ValueError(f"Could not safely inspect {relative}: {exc}") from exc
+            continue
+        if updated != original:
+            originals[file_path] = original
+            changes[file_path] = updated
+            if file_path.resolve() == primary_path.resolve():
+                primary_found = True
+
+    if not primary_found:
+        raise ValueError(f"Function `{old_name}` was not found in {primary_path.relative_to(root)}.")
+    if expected_original_code is not None and _normalize_code(originals[primary_path]) != _normalize_code(expected_original_code):
+        raise ValueError("The target file changed since analysis. Rename aborted to protect newer edits.")
+
+    for path, code in changes.items():
+        try:
+            ast.parse(code, filename=str(path))
+        except SyntaxError as exc:
+            raise ValueError(f"Renaming would make {path.relative_to(root)} invalid Python at line {exc.lineno}: {exc.msg}") from exc
+
+    written: list[Path] = []
+    try:
+        for path, code in changes.items():
+            _atomic_write(path, code)
+            written.append(path)
+        relative_files = [str(path.relative_to(root)) for path in changes]
+        validation = validate_repair_with_tests(TestValidationRequest(
+            files_to_validate=relative_files,
+            workspace_root=str(root),
+            code_overrides={},
+            run_pytest=True,
+        ))
+        has_test_suite = (root / "tests").exists() or any(
+            path.name.startswith("test_") or path.name.endswith("_test.py")
+            for path in root.rglob("*.py")
+            if not any(part.lower() in skip_dirs for part in path.relative_to(root).parts[:-1])
+        )
+        passed = validation.passed and validation.syntax_passed and validation.tests_passed if has_test_suite else validation.syntax_passed
+        if not passed:
+            raise RuntimeError(validation.output_log or "Workspace validation failed after the rename.")
+    except Exception as exc:
+        for path in reversed(written):
+            _atomic_write(path, originals[path])
+        return RepairApplyResult(
+            success=False,
+            issue_id=issue_id,
+            file_path=str(primary_path.relative_to(root)),
+            severity=severity,
+            validation_status="FAILED",
+            output_logs=str(exc),
+            rollback_status="RESTORED" if written else "NOT_APPLICABLE",
+            explanation="The multi-file function rename failed validation and all changed files were restored.",
+        )
+
+    first_change_id: Optional[int] = None
+    for path, code in changes.items():
+        entry = ledger.insert_log(
+            file_path=str(path),
+            previous_code=originals[path],
+            new_code=code,
+            severity=severity,
+            changed_by=ledger.ChangedBy.AI,
+            details=(
+                f"Issue: {issue_title or issue_id}. {issue_description or ''} "
+                f"Renamed function `{old_name}` to `{new_name}` across the workspace."
+            ).strip(),
+            issue_id=issue_id,
+            validation_result="PASSED",
+            status=ledger.LedgerStatus.ACTIVE,
+            workspace_root=str(root),
+        )
+        if first_change_id is None:
+            first_change_id = entry.id
+
+    return RepairApplyResult(
+        success=True,
+        issue_id=issue_id,
+        file_path=str(primary_path.relative_to(root)),
+        severity=severity,
+        validation_status="PASSED",
+        output_logs=validation.output_log,
+        rollback_status="NOT_NEEDED",
+        explanation=f"Renamed `{old_name}` to `{new_name}` in {len(changes)} Python file(s).",
+        change_id=first_change_id,
+        details=validation.details,
+        updated_files={str(path.relative_to(root)): code for path, code in changes.items()},
+    )
+
+
 def apply_automatic_repair(
     issue_id: str,
     file_path: str,
@@ -87,6 +225,10 @@ def apply_automatic_repair(
     approval: bool = False,
     original_code_hash: Optional[str] = None,
     expected_original_code: Optional[str] = None,
+    rename_symbol_from: Optional[str] = None,
+    rename_symbol_to: Optional[str] = None,
+    issue_title: Optional[str] = None,
+    issue_description: Optional[str] = None,
 ) -> RepairApplyResult:
     """
     Executes an automated code repair under strict safety, security, and verification guarantees.
@@ -172,6 +314,38 @@ def apply_automatic_repair(
             rollback_status="NOT_APPLICABLE",
             explanation=f"Workspace path resolution failed: {exc}",
         )
+
+    if rename_symbol_from or rename_symbol_to:
+        if not (rename_symbol_from and rename_symbol_to):
+            return RepairApplyResult(
+                success=False, issue_id=issue_id, file_path=clean_path, severity=severity,
+                validation_status="REJECTED", output_logs="", rollback_status="NOT_APPLICABLE",
+                explanation="Both the current and replacement function names are required.",
+            )
+        if not resolved_target.is_file():
+            return RepairApplyResult(
+                success=False, issue_id=issue_id, file_path=clean_path, severity=severity,
+                validation_status="NOT_FOUND", output_logs="", rollback_status="NOT_APPLICABLE",
+                explanation=f"Target file does not exist on disk: {resolved_target}",
+            )
+        try:
+            return _apply_workspace_rename(
+                issue_id=issue_id,
+                root=root,
+                primary_path=resolved_target,
+                old_name=rename_symbol_from,
+                new_name=rename_symbol_to,
+                expected_original_code=expected_original_code,
+                severity=severity,
+                issue_title=issue_title,
+                issue_description=issue_description,
+            )
+        except ValueError as exc:
+            return RepairApplyResult(
+                success=False, issue_id=issue_id, file_path=clean_path, severity=severity,
+                validation_status="CONFLICT", output_logs="", rollback_status="NOT_APPLICABLE",
+                explanation=str(exc),
+            )
 
     # 4. Check file existence and read original source
     if not resolved_target.is_file():
@@ -325,7 +499,10 @@ def apply_automatic_repair(
         new_code=proposed_code,
         severity=severity,
         changed_by=ledger.ChangedBy.AI,
-        details=f"Automatic repair successfully applied for issue {issue_id}",
+        details=(
+            f"Issue: {issue_title or issue_id}. {issue_description or ''} "
+            "Automatic repair successfully applied."
+        ).strip(),
         issue_id=issue_id,
         validation_result="PASSED",
         status=ledger.LedgerStatus.ACTIVE,
@@ -350,6 +527,8 @@ def apply_repair_request(request: RepairApplyRequest) -> RepairApplyResult:
     """Convenience wrapper accepting a RepairApplyRequest Pydantic object."""
     return apply_automatic_repair(
         issue_id=request.issue_id,
+        issue_title=request.issue_title,
+        issue_description=request.issue_description,
         file_path=request.file_path,
         severity=request.severity,
         proposed_code=request.proposed_code,
@@ -358,5 +537,7 @@ def apply_repair_request(request: RepairApplyRequest) -> RepairApplyResult:
         approval=request.approval,
         original_code_hash=request.original_code_hash,
         expected_original_code=request.expected_original_code,
+        rename_symbol_from=request.rename_symbol_from,
+        rename_symbol_to=request.rename_symbol_to,
     )
 

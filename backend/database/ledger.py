@@ -205,6 +205,7 @@ def insert_log(
     rollback_ref: Optional[int] = None,
     workspace_root: Optional[str] = None,
     write_to_disk: bool = False,
+    record_only: bool = False,
     db_path: Optional[Path] = None,
 ) -> LedgerEntry:
     """Record a code modification in the audit ledger, optionally writing safely to disk."""
@@ -222,6 +223,13 @@ def insert_log(
             actual_previous = resolved_target.read_text(encoding="utf-8", errors="replace")
         except Exception:
             actual_previous = previous_code
+
+    # Confirmation and user feedback events describe an existing file state; they
+    # must not replace the file with notes or a duplicate copy of a prior patch.
+    if record_only:
+        if not resolved_target.is_file():
+            raise FileNotFoundError(f"Target file for ledger event does not exist: {resolved_target}")
+        new_code = actual_previous
 
     if write_to_disk and new_code:
         _atomic_write(resolved_target, new_code)
@@ -276,8 +284,22 @@ def rollback_change(
         if row["status"] == LedgerStatus.ROLLED_BACK.value:
             raise ValueError(f"Ledger entry {entry_id} is already rolled back.")
 
-        # 1. Enforce workspace path containment
-        target_file = _resolve_path(row["file_path"], workspace_root)
+        # 1. Resolve the workspace recorded with this change. A currently
+        # selected upload may be a different workspace than this historical entry.
+        recorded_path = Path(row["file_path"].replace("file:", "").strip()).expanduser()
+        if recorded_path.is_absolute() and not workspace_root:
+            target_file = recorded_path.resolve()
+            managed_workspaces = Path(__file__).resolve().parent.parent / "data" / "workspaces"
+            allowed_roots = [managed_workspaces]
+            configured_root = os.getenv("ARCHITEX_WORKSPACE")
+            if configured_root:
+                allowed_roots.append(Path(configured_root).expanduser().resolve())
+            if not any(_is_relative_to(target_file, root) for root in allowed_roots):
+                raise ValueError(
+                    f"Rollback target '{target_file}' is outside the managed workspace folders."
+                )
+        else:
+            target_file = _resolve_path(row["file_path"], workspace_root)
         if not target_file.is_file():
             raise FileNotFoundError(f"Target file for rollback does not exist: {target_file}")
 

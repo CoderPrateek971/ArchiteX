@@ -176,10 +176,17 @@ def write_workspace_file(workspace_id: str, file_path: str, content: str) -> Pat
 def create_workspace_zip(workspace_id: str) -> bytes:
     root = get_workspace_root(workspace_id)
     buffer = io.BytesIO()
+    export_skip_dirs = {
+        ".git", ".hg", ".svn", ".venv", "venv", "env", "__pycache__",
+        ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "node_modules",
+        "dist", "build", ".next", "site-packages",
+    }
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for file in root.rglob("*"):
             if file.is_file():
                 rel = file.relative_to(root)
+                if any(part.lower() in export_skip_dirs for part in rel.parts[:-1]):
+                    continue
                 zip_file.write(file, arcname=str(rel))
     buffer.seek(0)
     return buffer.getvalue()

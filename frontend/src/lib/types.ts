@@ -116,6 +116,7 @@ export type CodebaseQnAResponse = {
   relevant_symbols: string[];
   model_used?: string | null;
   fallback_used?: boolean;
+  fallback_reason?: string | null;
 };
 
 export type GraphPayload = {
@@ -274,6 +275,7 @@ export type LedgerLogRequest = {
   details?: string;
   issue_id?: string;
   validation_result?: string;
+  record_only?: boolean;
   workspace_root?: string;
 };
 
@@ -283,6 +285,8 @@ export type LedgerLogRequest = {
 
 export type RepairApplyRequest = {
   issue_id: string;
+  issue_title?: string | null;
+  issue_description?: string | null;
   file_path: string;
   severity: string;
   proposed_code: string;
@@ -291,6 +295,8 @@ export type RepairApplyRequest = {
   approval: boolean;
   original_code_hash?: string | null;
   expected_original_code?: string | null;
+  rename_symbol_from?: string | null;
+  rename_symbol_to?: string | null;
 };
 
 export type RepairApplyResult = {
@@ -304,6 +310,7 @@ export type RepairApplyResult = {
   explanation: string;
   change_id?: number | null;
   details?: { file: string; check: string; status: string; error?: string }[];
+  updated_files?: Record<string, string>;
 };
 
 // =====================================================================

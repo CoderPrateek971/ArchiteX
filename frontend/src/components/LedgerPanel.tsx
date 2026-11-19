@@ -14,7 +14,7 @@ import {
   ShieldAlert,
 } from "lucide-react";
 import { errorMessage, fetchLedger, rollbackLedgerChange } from "../lib/api";
-import type { LedgerEntry } from "../lib/types";
+import type { DebtFinding, LedgerEntry } from "../lib/types";
 
 function formatTime(value: string) {
   const date = new Date(value);
@@ -26,14 +26,16 @@ type Props = {
   open: boolean;
   onClose: () => void;
   refreshKey: number;
-  workspaceRoot?: string;
+  findings?: DebtFinding[];
+  onRollback?: (entry: LedgerEntry) => Promise<string>;
 };
 
-export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }: Props) {
+export default function LedgerPanel({ open, onClose, refreshKey, findings = [], onRollback }: Props) {
   const [entries, setEntries] = useState<LedgerEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [rollingBack, setRollingBack] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [rollbackNotice, setRollbackNotice] = useState<string | null>(null);
   const [conflictWarning, setConflictWarning] = useState<string | null>(null);
 
   useEffect(() => {
@@ -42,6 +44,7 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setRollbackNotice(null);
     setConflictWarning(null);
 
     fetchLedger()
@@ -60,20 +63,32 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
     };
   }, [open, refreshKey]);
 
-  async function handleRollback(id: number) {
+  async function handleRollback(entry: LedgerEntry, issue?: DebtFinding) {
+    const issueLabel = issue?.title || entry.issue_id || "Unlabeled change";
+    const issueDescription = issue?.description || entry.details;
+    const isRollbackAction = entry.rollback_ref != null;
+    const actionLabel = isRollbackAction ? "Undo this rollback action" : "Rollback this change";
     const confirmed = window.confirm(
-      "Are you sure you want to rollback change #" +
-        id +
-        "? ArchiteX will verify that the file has not been modified since this change was recorded before reverting."
+      `${actionLabel} #${entry.id} for “${issueLabel}”${issueDescription ? `?\n\n${issueDescription}` : "?"}${isRollbackAction ? `\n\nThis entry reverses ledger change #${entry.rollback_ref}.` : ""}\n\nFile: ${entry.file_path}\n\nArchiteX will check for newer edits before restoring this file.`
     );
     if (!confirmed) return;
 
-    setRollingBack(id);
+    setRollingBack(entry.id);
     setError(null);
     setConflictWarning(null);
+    setRollbackNotice(null);
     try {
-      const updated = await rollbackLedgerChange(id, workspaceRoot);
-      setEntries((current) => current.map((entry) => (entry.id === id ? updated : entry)));
+      // Ledger paths point to the workspace where each change was made. Do not
+      // pass the currently selected repository root, which may be a different upload.
+      await rollbackLedgerChange(entry.id);
+      setRollbackNotice(
+        (await onRollback?.(entry)) || `Change #${entry.id} rolled back in the ArchiteX workspace.`
+      );
+      try {
+        setEntries(await fetchLedger());
+      } catch (refreshError) {
+        setError(`Rollback completed, but the ledger could not refresh: ${errorMessage(refreshError)}`);
+      }
     } catch (err: any) {
       const msg = errorMessage(err);
       if (err?.response?.status === 409 || msg.toLowerCase().includes("conflict")) {
@@ -171,6 +186,7 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
           )}
 
           {error && <div className="error-banner">{error}</div>}
+          {rollbackNotice && <div className="ledger-rollback-notice" role="status">{rollbackNotice}</div>}
 
           {!loading && entries.length === 0 && !error && (
             <div className="empty-state">
@@ -185,6 +201,7 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
               const isFailed = entry.status === "failed";
               const isAI = entry.changed_by === "AI";
               const cleanPath = entry.file_path.replace(/^file:/, "");
+              const issue = findings.find((finding) => finding.id?.toLowerCase() === entry.issue_id?.toLowerCase());
 
               return (
                 <div key={entry.id} className="timeline-item">
@@ -316,17 +333,12 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
                       )}
                     </div>
 
-                    {entry.details && (
-                      <p
-                        style={{
-                          fontSize: 11,
-                          color: "var(--text-secondary)",
-                          marginBottom: 8,
-                          lineHeight: 1.4,
-                        }}
-                      >
-                        {entry.details}
-                      </p>
+                    {(issue || entry.issue_id || entry.details) && (
+                      <div className="ledger-issue-context">
+                        <strong>{issue?.title || (entry.issue_id ? `Issue ${entry.issue_id}` : "Change details")}</strong>
+                        <span>{issue?.description || entry.details || "No issue description was saved for this older change."}</span>
+                        {issue && entry.details && <span className="ledger-change-detail">Change: {entry.details}</span>}
+                      </div>
                     )}
 
                     {/* Footer: Status Badge and Selective Rollback Action */}
@@ -369,13 +381,15 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
                       <button
                         type="button"
                         disabled={isRolledBack || isFailed || rollingBack === entry.id}
-                        onClick={() => void handleRollback(entry.id)}
+                        onClick={() => void handleRollback(entry, issue)}
                         className="btn-rollback"
                         title={
                           isRolledBack
                             ? "This change has already been rolled back"
                             : isFailed
                             ? "Cannot roll back a failed repair attempt"
+                            : entry.rollback_ref != null
+                            ? `Undo this rollback action (ledger change #${entry.rollback_ref})`
                             : "Selectively rollback this modification with conflict detection"
                         }
                       >
@@ -385,7 +399,7 @@ export default function LedgerPanel({ open, onClose, refreshKey, workspaceRoot }
                           <RotateCcw size={12} />
                         )}
                         <span>
-                          {isRolledBack ? "Rolled Back" : isFailed ? "Failed" : "Rollback File"}
+                          {isRolledBack ? "Rolled Back" : isFailed ? "Failed" : entry.rollback_ref != null ? "Undo Rollback" : "Rollback File"}
                         </span>
                       </button>
                     </div>

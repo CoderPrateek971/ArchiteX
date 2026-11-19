@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   MessageSquare,
   Send,
@@ -9,6 +10,7 @@ import {
   HelpCircle,
   Key,
   Check,
+  RotateCcw,
 } from "lucide-react";
 import { askCodebase, errorMessage, getLLMStatus, setGeminiApiKey, type LLMStatus } from "../lib/api";
 import type { CodebaseQnAResponse, GraphPayload } from "../lib/types";
@@ -85,8 +87,6 @@ export default function CodebaseChatDrawer({
     }
   };
 
-  if (!open) return null;
-
   const handleAsk = async (qText: string) => {
     const cleanQ = qText.trim();
     if (!cleanQ || !graph) return;
@@ -105,7 +105,18 @@ export default function CodebaseChatDrawer({
     }
   };
 
-  return (
+  useEffect(() => {
+    if (!open) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  return createPortal((
     <div className="chat-drawer-backdrop" onClick={onClose}>
       <div className="chat-drawer" onClick={(e) => e.stopPropagation()}>
         {/* Drawer Header */}
@@ -117,12 +128,19 @@ export default function CodebaseChatDrawer({
             <div>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <h3 className="drawer-title">Codebase Intelligence Q&A</h3>
-                {llmStatus?.has_gemini_key ? (
+                {llmStatus?.active_provider === "gemini" ? (
                   <span
                     className="llm-pill connected"
                     title={`Connected via ${llmStatus.primary_model}`}
                   >
-                    <Sparkles size={10} /> Gemini Active
+                    <Sparkles size={10} /> Gemini Configured
+                  </span>
+                ) : llmStatus?.has_gemini_key ? (
+                  <span
+                    className="llm-pill warning"
+                    title={`Gemini key is configured; codebase Q&A currently uses ${llmStatus.primary_model}`}
+                  >
+                    <Key size={10} /> Gemini Key Saved
                   </span>
                 ) : (
                   <button
@@ -189,7 +207,7 @@ export default function CodebaseChatDrawer({
               </button>
             </div>
             <p className="gemini-key-hint">
-              Saved securely to <code>backend/.env</code> as <code>GEMINI_API_KEY</code> and activates Gemini 1.5 Flash for your chatbot.
+              Saved to the backend environment as <code>GEMINI_API_KEY</code>. Codebase questions use the configured Gemini model, with a local fallback if Gemini is unavailable.
             </p>
           </form>
         )}
@@ -247,10 +265,31 @@ export default function CodebaseChatDrawer({
                   <span className="qa-label text-cyan">A:</span>
                   {item.model_used && (
                     <span className="arch-ai-tag">
-                      <Sparkles size={11} /> {item.model_used}
+                      <Sparkles size={11} />
+                      {item.model_used === "architex-local-engine" ? "Local AST answer" : item.model_used}
                     </span>
                   )}
                 </div>
+                {item.fallback_used && (
+                  <div className="chat-fallback-note" role="status">
+                    <span>
+                      {item.model_used === "architex-local-engine"
+                        ? `Gemini did not return an answer, so this response uses the scanned files. ${item.fallback_reason || ""}`
+                        : `The primary model was unavailable; answered with ${item.model_used || "the Gemini fallback model"}. ${item.fallback_reason || ""}`}
+                    </span>
+                    {item.model_used === "architex-local-engine" && (
+                      <button
+                        type="button"
+                        className="chat-retry-btn"
+                        onClick={() => void handleAsk(item.question)}
+                        disabled={loading}
+                      >
+                        {loading ? <Loader2 size={13} className="animate-spin" /> : <RotateCcw size={13} />}
+                        Retry Gemini
+                      </button>
+                    )}
+                  </div>
+                )}
                 <div className="qa-answer-body">
                   <MarkdownRenderer content={item.answer} compact />
                 </div>
@@ -308,5 +347,5 @@ export default function CodebaseChatDrawer({
         </form>
       </div>
     </div>
-  );
+  ), document.body);
 }

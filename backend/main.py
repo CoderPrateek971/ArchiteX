@@ -5,6 +5,7 @@ from typing import Optional, List
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 # Keep your AI services imports
@@ -35,12 +36,15 @@ from services.llm_router import (
     compare_model_responses,
     generate_completion,
     get_model_profiles,
+    get_llm_connection_status,
     route_and_generate,
+    save_gemini_api_key,
 )
 from services.workspace_manager import (
     create_workspace_from_zip,
     create_workspace_from_git,
     read_workspace_file,
+    create_workspace_zip,
     cleanup_workspace,
 )
 from database import ledger
@@ -56,6 +60,8 @@ app = FastAPI(title="ArchiteX API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    # Vite uses the next available port (for example 3001) when 3000 is occupied.
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):30[0-9]{2}$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -96,16 +102,30 @@ class LedgerLogRequest(BaseModel):
     workspace_root: Optional[str] = None
     issue_id: Optional[str] = None
     validation_result: Optional[str] = None
+    record_only: bool = False
 
 class RollbackRequest(BaseModel):
     id: int
     workspace_root: Optional[str] = None
+
+
+class GeminiApiKeyRequest(BaseModel):
+    api_key: str = Field(..., min_length=1, max_length=512)
 
 class GitCloneRequest(BaseModel):
     url: str = Field(..., min_length=1, description="URL of the Git repository to clone")
     branch: Optional[str] = Field(None, description="Optional branch or tag name")
 
 # --- 3. Core AI Endpoints ---
+@app.get("/")
+def root() -> dict:
+    return {
+        "service": "ArchiteX API",
+        "status": "ok",
+        "health": "/health",
+        "docs": "/docs",
+    }
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -193,6 +213,20 @@ def delete_workspace(workspace_id: str) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+@app.get("/api/workspace/{workspace_id}/download")
+def download_workspace(workspace_id: str) -> Response:
+    try:
+        archive = create_workspace_zip(workspace_id)
+        return Response(
+            content=archive,
+            media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="architex-updated-project.zip"'},
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to export updated project: {exc}") from exc
+
 @app.post("/api/analyze-debt", response_model=DebtReport)
 def analyze_repo_debt(graph: GraphPayload) -> DebtReport:
     try:
@@ -227,6 +261,21 @@ def ask_codebase_endpoint(request: AskCodebaseRequest) -> CodebaseQnAResponse:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Codebase Q&A failed: {exc}") from exc
 
+
+@app.get("/api/llm/status")
+def llm_connection_status() -> dict:
+    return get_llm_connection_status()
+
+
+@app.post("/api/llm/gemini-key")
+def configure_gemini_key(request: GeminiApiKeyRequest) -> dict:
+    try:
+        return save_gemini_api_key(request.api_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not save Gemini configuration: {exc}") from exc
+
 # --- 4. Ledger & Automatic Repair Endpoints ---
 @app.get("/api/ledger")
 def get_ledger() -> List[dict]:
@@ -246,7 +295,8 @@ def log_ledger_change(request: LedgerLogRequest):
             issue_id=request.issue_id,
             validation_result=request.validation_result,
             workspace_root=request.workspace_root,
-            write_to_disk=True,
+            write_to_disk=not request.record_only,
+            record_only=request.record_only,
         )
         return entry.model_dump()
     except ValueError as exc:

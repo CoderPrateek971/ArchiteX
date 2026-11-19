@@ -132,10 +132,12 @@ export default function ResolutionView({ finding, onResolved, onClose, workspace
         file_path: step.file_path,
         severity: finding.severity.toLowerCase(),
         changed_by: "AI",
+        issue_id: finding.id || `${finding.file_name}:${finding.line_number ?? 0}`,
         details: `Guided Repair Step ${step.order} applied: ${step.action_title}`,
         previous_code: "Original code recorded in ledger",
         new_code: codeToApply,
         workspace_root: workspaceRoot,
+        validation_result: "PENDING_REVIEW",
       });
 
       setAppliedSteps((prev) => ({ ...prev, [step.order]: true }));
@@ -193,8 +195,9 @@ export default function ResolutionView({ finding, onResolved, onClose, workspace
     setIsSubmitting(true);
     setFeedback(null);
 
+    const coreStep = steps.find((step) => step.action_type === "CORE_REMEDIATION");
     const newCode = followedExact
-      ? (stepCodes[2] || finding.proposed_code || plan?.proposed_code || "# AI Guided Repair applied\n")
+      ? (coreStep ? (stepCodes[coreStep.order] || coreStep.proposed_code) : (finding.proposed_code || plan?.proposed_code || ""))
       : (customFileContent || customNotes || "# User Custom Guided Repair\n");
 
     const details = followedExact
@@ -206,10 +209,13 @@ export default function ResolutionView({ finding, onResolved, onClose, workspace
         file_path: cleanFilePath,
         severity: finding.severity.toLowerCase(),
         changed_by: followedExact ? "AI" : "User",
+        issue_id: finding.id || `${finding.file_name}:${finding.line_number ?? 0}`,
         details: details,
         previous_code: "Original code recorded in ledger",
         new_code: newCode,
         workspace_root: workspaceRoot,
+        validation_result: validationResult?.passed ? "PASSED" : (validationResult ? "FAILED" : "NOT_RUN"),
+        record_only: followedExact || !customFileContent,
       });
 
       setFeedback("✨ Repair plan fully completed and logged to Smart Ledger!");
@@ -585,6 +591,24 @@ export default function ResolutionView({ finding, onResolved, onClose, workspace
             onChange={(e) => setCustomNotes(e.target.value)}
             placeholder="e.g. Renamed user_token instead of token_id and added guard clause..."
           />
+
+          <label style={{ display: "block", margin: "8px 0", fontSize: 11, color: "var(--text-secondary)" }}>
+            Or upload the updated Python file
+            <input
+              type="file"
+              accept=".py,text/x-python,text/plain"
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                if (!file) return;
+                setCustomFileName(file.name);
+                const reader = new FileReader();
+                reader.onload = () => setCustomFileContent(String(reader.result ?? ""));
+                reader.onerror = () => setFeedback("Could not read the selected file.");
+                reader.readAsText(file);
+              }}
+            />
+            {customFileName && <span style={{ marginLeft: 8 }}>{customFileName}</span>}
+          </label>
 
           <div className="button-row">
             <button
