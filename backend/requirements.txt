@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 pydantic
 litellm
+tenacity
 python-dotenv
 python-multipart
 pytest>=8.0

@@ -1376,8 +1376,29 @@ async function linkedFileExists(root: SourceDirectory, relativePath: string): Pr
           <ResolutionView
             finding={activeFinding}
             workspaceRoot={graph?.repo_root}
+            sourceFiles={graph?.file_map}
             onClose={() => setActiveFinding(null)}
-            onResolved={() => {
+            onResolved={(resolvedFinding, updatedFiles) => {
+              const resolvedFindingKey = getFindingKey(resolvedFinding);
+              setFindings((current) => current.filter((item) => getFindingKey(item) !== resolvedFindingKey));
+              if (updatedFiles && Object.keys(updatedFiles).length > 0) {
+                setGraph((current) => {
+                  if (!current) return current;
+                  const normalizedChanges = Object.fromEntries(
+                    Object.entries(updatedFiles).map(([path, code]) => [path.replace(/^file:/, "").replace(/\\/g, "/"), code])
+                  );
+                  return {
+                    ...current,
+                    file_map: { ...current.file_map, ...normalizedChanges },
+                    nodes: current.nodes.map((node) => {
+                      const nodePath = String(node.data.path || "").replace(/^file:/, "").replace(/\\/g, "/");
+                      return (node.data.kind || node.type) === "file" && Object.prototype.hasOwnProperty.call(normalizedChanges, nodePath)
+                        ? { ...node, data: { ...node.data, source: normalizedChanges[nodePath] } }
+                        : node;
+                    }),
+                  };
+                });
+              }
               setActiveFinding(null);
               setLedgerRefresh((prev) => prev + 1);
             }}

@@ -264,6 +264,13 @@ export type LedgerEntry = {
   rollback_ref?: number | null;
   before_hash?: string | null;
   after_hash?: string | null;
+  file_changes?: Array<{
+    file_path: string;
+    previous_code: string;
+    new_code: string;
+    before_hash?: string;
+    after_hash?: string;
+  }> | null;
 };
 
 export type LedgerLogRequest = {
@@ -277,6 +284,7 @@ export type LedgerLogRequest = {
   validation_result?: string;
   record_only?: boolean;
   workspace_root?: string;
+  file_changes?: Array<{ file_path: string; new_code: string; expected_code?: string }>;
 };
 
 // =====================================================================

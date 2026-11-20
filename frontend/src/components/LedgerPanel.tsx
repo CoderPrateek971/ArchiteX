@@ -201,7 +201,19 @@ export default function LedgerPanel({ open, onClose, refreshKey, findings = [], 
               const isFailed = entry.status === "failed";
               const isAI = entry.changed_by === "AI";
               const cleanPath = entry.file_path.replace(/^file:/, "");
+              const fileChanges = entry.file_changes || [];
+              const displayPath = fileChanges.length > 1
+                ? `${fileChanges.length} files changed`
+                : cleanPath.split("/").slice(-2).join("/");
+              const pathTitle = fileChanges.length
+                ? fileChanges.map((change) => change.file_path).join("\n")
+                : cleanPath;
               const issue = findings.find((finding) => finding.id?.toLowerCase() === entry.issue_id?.toLowerCase());
+              const completedIssueTitle = entry.details?.match(/^Completed Guided Repair Plan for:\s*(.+)$/)?.[1];
+              const validation = entry.validation_result?.trim().toUpperCase() || "";
+              const validationNotRun = validation === "NOT_RUN" || validation === "PENDING_REVIEW";
+              const validationPassed = validation.includes("PASSED");
+              const validationLabel = validation === "PENDING_REVIEW" ? "Pending review" : validation === "NOT_RUN" ? "Not run" : validationPassed ? "Passed" : "Failed";
 
               return (
                 <div key={entry.id} className="timeline-item">
@@ -239,15 +251,15 @@ export default function LedgerPanel({ open, onClose, refreshKey, findings = [], 
                           ) : (
                             <User size={14} color="var(--cyan-400)" />
                           )}
-                          <span className="ledger-file-name" title={cleanPath}>
-                            {cleanPath}
+                          <span className="ledger-file-name" title={pathTitle}>
+                            {displayPath}
                           </span>
                         </div>
                         <p className="ledger-time">{formatTime(entry.timestamp)}</p>
                       </div>
 
                       {/* Badges: Severity and Changed-By */}
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <div className="ledger-entry-badges">
                         <span
                           className={`severity-pill ${
                             entry.severity
@@ -310,34 +322,56 @@ export default function LedgerPanel({ open, onClose, refreshKey, findings = [], 
                             gap: 4,
                             fontSize: 10,
                             fontFamily: "var(--font-mono)",
-                            color:
-                              entry.validation_result.toUpperCase().includes("PASSED")
-                                ? "var(--emerald-400)"
+                            color: validationPassed
+                              ? "var(--emerald-400)"
+                              : validationNotRun
+                                ? "var(--text-muted)"
                                 : "var(--red-400)",
-                            background:
-                              entry.validation_result.toUpperCase().includes("PASSED")
-                                ? "var(--emerald-bg)"
+                            background: validationPassed
+                              ? "var(--emerald-bg)"
+                              : validationNotRun
+                                ? "rgba(148, 163, 184, 0.1)"
                                 : "rgba(239, 68, 68, 0.15)",
                             padding: "2px 6px",
                             borderRadius: "var(--radius-sm)",
                           }}
                           title={entry.validation_result}
                         >
-                          {entry.validation_result.toUpperCase().includes("PASSED") ? (
+                          {validationPassed ? (
                             <ShieldCheck size={10} />
                           ) : (
                             <ShieldAlert size={10} />
                           )}
-                          Validation: {entry.validation_result.toUpperCase().includes("PASSED") ? "PASSED" : "FAILED"}
+                          Validation: {validationLabel}
                         </span>
                       )}
                     </div>
 
-                    {(issue || entry.issue_id || entry.details) && (
+                    {(issue || entry.issue_id || entry.details || fileChanges.length > 0) && (
                       <div className="ledger-issue-context">
-                        <strong>{issue?.title || (entry.issue_id ? `Issue ${entry.issue_id}` : "Change details")}</strong>
-                        <span>{issue?.description || entry.details || "No issue description was saved for this older change."}</span>
-                        {issue && entry.details && <span className="ledger-change-detail">Change: {entry.details}</span>}
+                        <strong>{issue?.title || completedIssueTitle || (entry.issue_id ? `Issue ${entry.issue_id}` : "Change details")}</strong>
+                        <span className="ledger-issue-description">{issue?.description || (completedIssueTitle ? "Resolution recorded in history." : fileChanges.length ? "One combined change includes a saved before and after version for each file." : entry.details) || "No issue description was saved for this older change."}</span>
+                        {(entry.details || fileChanges.length > 0) && (
+                          <details className="ledger-change-details">
+                            <summary>{fileChanges.length ? `Change details · ${fileChanges.length} file${fileChanges.length === 1 ? "" : "s"}` : "Change details"}</summary>
+                            {entry.details && <span>{entry.details}</span>}
+                            {fileChanges.map((change) => (
+                              <div className="ledger-file-snapshot" key={change.file_path}>
+                                <strong>{change.file_path.split("/").slice(-2).join("/")}</strong>
+                                <div className="ledger-snapshot-columns">
+                                  <div>
+                                    <span>Previous</span>
+                                    <pre>{change.previous_code}</pre>
+                                  </div>
+                                  <div>
+                                    <span>Saved</span>
+                                    <pre>{change.new_code}</pre>
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </details>
+                        )}
                       </div>
                     )}
 
@@ -390,7 +424,9 @@ export default function LedgerPanel({ open, onClose, refreshKey, findings = [], 
                             ? "Cannot roll back a failed repair attempt"
                             : entry.rollback_ref != null
                             ? `Undo this rollback action (ledger change #${entry.rollback_ref})`
-                            : "Selectively rollback this modification with conflict detection"
+                            : fileChanges.length > 1
+                              ? `Roll back all ${fileChanges.length} files in this combined repair`
+                              : "Selectively rollback this modification with conflict detection"
                         }
                       >
                         {rollingBack === entry.id ? (
@@ -399,7 +435,7 @@ export default function LedgerPanel({ open, onClose, refreshKey, findings = [], 
                           <RotateCcw size={12} />
                         )}
                         <span>
-                          {isRolledBack ? "Rolled Back" : isFailed ? "Failed" : entry.rollback_ref != null ? "Undo Rollback" : "Rollback File"}
+                          {isRolledBack ? "Rolled Back" : isFailed ? "Failed" : entry.rollback_ref != null ? "Undo Rollback" : fileChanges.length > 1 ? "Rollback Change" : "Rollback File"}
                         </span>
                       </button>
                     </div>

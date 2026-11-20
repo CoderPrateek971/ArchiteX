@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import sqlite3
 import ast
@@ -49,6 +50,7 @@ class LedgerEntry(BaseModel):
     rollback_ref: Optional[int] = None
     before_hash: Optional[str] = None
     after_hash: Optional[str] = None
+    file_changes: Optional[list[dict[str, str]]] = None
 
 
 class LedgerLogRequest(BaseModel):
@@ -125,7 +127,8 @@ def init_db(db_path: Path | None = None) -> None:
                 status TEXT NOT NULL DEFAULT 'active',
                 rollback_ref INTEGER DEFAULT NULL,
                 before_hash TEXT DEFAULT NULL,
-                after_hash TEXT DEFAULT NULL
+                after_hash TEXT DEFAULT NULL,
+                file_changes TEXT DEFAULT NULL
             )
             """
         )
@@ -140,6 +143,7 @@ def init_db(db_path: Path | None = None) -> None:
             "rollback_ref": "INTEGER DEFAULT NULL",
             "before_hash": "TEXT DEFAULT NULL",
             "after_hash": "TEXT DEFAULT NULL",
+            "file_changes": "TEXT DEFAULT NULL",
         }
         for col_name, col_def in columns_to_add.items():
             if col_name not in existing_cols:
@@ -206,6 +210,7 @@ def insert_log(
     workspace_root: Optional[str] = None,
     write_to_disk: bool = False,
     record_only: bool = False,
+    file_changes: Optional[list[dict[str, str]]] = None,
     db_path: Optional[Path] = None,
 ) -> LedgerEntry:
     """Record a code modification in the audit ledger, optionally writing safely to disk."""
@@ -213,16 +218,50 @@ def insert_log(
     chg_str = "AI" if str(changed_by.value if isinstance(changed_by, ChangedBy) else changed_by).lower() == "ai" else "User"
     stat_str = str(status.value if isinstance(status, LedgerStatus) else status).lower()
 
-    # Enforce workspace path containment
-    resolved_target = _resolve_path(file_path, workspace_root)
-    stored_path = str(resolved_target)
+    snapshots: list[dict[str, str]] = []
+    if file_changes:
+        if record_only:
+            raise ValueError("A combined file change cannot be recorded as read-only.")
+        seen_paths: set[str] = set()
+        for change in file_changes:
+            change_path = str(change.get("file_path") or "").strip()
+            if not change_path or change_path in seen_paths:
+                raise ValueError("Combined changes must contain unique file paths.")
+            seen_paths.add(change_path)
+            target = _resolve_path(change_path, workspace_root)
+            if not target.is_file():
+                raise FileNotFoundError(f"Target file for combined change does not exist: {target}")
+            before = target.read_text(encoding="utf-8", errors="replace")
+            expected = change.get("expected_code")
+            if expected is not None and _normalize_code(before) != _normalize_code(expected):
+                raise ConflictError(
+                    f"Cannot save combined repair: '{target.name}' changed since it was scanned. "
+                    "Refresh the repository and review the repair again."
+                )
+            after = str(change.get("new_code") or "")
+            snapshots.append({
+                "file_path": str(target),
+                "previous_code": before,
+                "new_code": after,
+                "before_hash": _compute_hash(before),
+                "after_hash": _compute_hash(after),
+            })
 
-    actual_previous = previous_code
-    if resolved_target.is_file() and (not previous_code or previous_code == "Original code recorded in ledger"):
-        try:
-            actual_previous = resolved_target.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            actual_previous = previous_code
+        resolved_target = Path(snapshots[0]["file_path"])
+        stored_path = str(resolved_target)
+        actual_previous = snapshots[0]["previous_code"]
+        new_code = snapshots[0]["new_code"]
+    else:
+        # Enforce workspace path containment
+        resolved_target = _resolve_path(file_path, workspace_root)
+        stored_path = str(resolved_target)
+
+        actual_previous = previous_code
+        if resolved_target.is_file() and (not previous_code or previous_code == "Original code recorded in ledger"):
+            try:
+                actual_previous = resolved_target.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                actual_previous = previous_code
 
     # Confirmation and user feedback events describe an existing file state; they
     # must not replace the file with notes or a duplicate copy of a prior patch.
@@ -231,38 +270,54 @@ def insert_log(
             raise FileNotFoundError(f"Target file for ledger event does not exist: {resolved_target}")
         new_code = actual_previous
 
-    if write_to_disk and new_code:
-        _atomic_write(resolved_target, new_code)
+    written_snapshots: list[dict[str, str]] = []
+    try:
+        if snapshots and write_to_disk:
+            for snapshot in snapshots:
+                _atomic_write(Path(snapshot["file_path"]), snapshot["new_code"])
+                written_snapshots.append(snapshot)
+        elif write_to_disk and new_code:
+            _atomic_write(resolved_target, new_code)
+    except Exception:
+        for snapshot in reversed(written_snapshots):
+            _atomic_write(Path(snapshot["file_path"]), snapshot["previous_code"])
+        raise
 
     before_hash = _compute_hash(actual_previous) if actual_previous else None
     after_hash = _compute_hash(new_code) if new_code else None
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    with _connect(db_path) as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO ledger (
-                timestamp, file_path, previous_code, new_code, severity, changed_by,
-                details, issue_id, validation_result, status, rollback_ref, before_hash, after_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                timestamp,
-                stored_path,
-                actual_previous,
-                new_code,
-                sev_str,
-                chg_str,
-                details or "",
-                issue_id,
-                validation_result,
-                stat_str,
-                rollback_ref,
-                before_hash,
-                after_hash,
-            ),
-        )
-        row = conn.execute("SELECT * FROM ledger WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    try:
+        with _connect(db_path) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO ledger (
+                    timestamp, file_path, previous_code, new_code, severity, changed_by,
+                    details, issue_id, validation_result, status, rollback_ref, before_hash, after_hash, file_changes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp,
+                    stored_path,
+                    actual_previous,
+                    new_code,
+                    sev_str,
+                    chg_str,
+                    details or "",
+                    issue_id,
+                    validation_result,
+                    stat_str,
+                    rollback_ref,
+                    before_hash,
+                    after_hash,
+                    json.dumps(snapshots) if snapshots else None,
+                ),
+            )
+            row = conn.execute("SELECT * FROM ledger WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    except Exception:
+        for snapshot in reversed(written_snapshots):
+            _atomic_write(Path(snapshot["file_path"]), snapshot["previous_code"])
+        raise
 
     return _row_to_entry(row)
 
@@ -283,6 +338,9 @@ def rollback_change(
 
         if row["status"] == LedgerStatus.ROLLED_BACK.value:
             raise ValueError(f"Ledger entry {entry_id} is already rolled back.")
+
+        if row["file_changes"]:
+            return _rollback_file_set(conn, row, entry_id, workspace_root)
 
         # 1. Resolve the workspace recorded with this change. A currently
         # selected upload may be a different workspace than this historical entry.
@@ -376,6 +434,106 @@ def rollback_change(
     return _row_to_entry(updated)
 
 
+def _rollback_file_set(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    entry_id: int,
+    workspace_root: str | None,
+) -> LedgerEntry:
+    """Atomically restore every file captured by one combined repair entry."""
+    snapshots = json.loads(row["file_changes"])
+    managed_workspaces = Path(__file__).resolve().parent.parent / "data" / "workspaces"
+    configured_root = os.getenv("ARCHITEX_WORKSPACE")
+    allowed_roots = [managed_workspaces]
+    if configured_root:
+        allowed_roots.append(Path(configured_root).expanduser().resolve())
+
+    current_states: list[tuple[Path, str, str]] = []
+    for snapshot in snapshots:
+        recorded_path = snapshot["file_path"]
+        if workspace_root:
+            target = _resolve_path(recorded_path, workspace_root)
+        else:
+            target = Path(recorded_path).expanduser().resolve()
+            if not target.is_absolute() or not any(_is_relative_to(target, root) for root in allowed_roots):
+                raise ValueError(f"Rollback target '{target}' is outside the managed workspace folders.")
+        if not target.is_file():
+            raise FileNotFoundError(f"Target file for rollback does not exist: {target}")
+
+        current = target.read_text(encoding="utf-8", errors="replace")
+        if _normalize_code(current) != _normalize_code(snapshot.get("new_code") or ""):
+            raise ConflictError(
+                f"Rollback conflict on '{target.name}': file has been modified since combined change #{entry_id}. "
+                "No files were restored."
+            )
+        previous = snapshot.get("previous_code") or ""
+        if target.suffix == ".py":
+            try:
+                ast.parse(previous, filename=str(target))
+            except SyntaxError as exc:
+                raise ValueError(
+                    f"Rollback validation failed: restored code for '{target.name}' has a syntax error at line {exc.lineno}."
+                ) from exc
+        current_states.append((target, current, previous))
+
+    written: list[tuple[Path, str]] = []
+    try:
+        for target, current, previous in current_states:
+            _atomic_write(target, previous)
+            written.append((target, current))
+    except Exception:
+        for target, current in reversed(written):
+            _atomic_write(target, current)
+        raise
+
+    first_target, first_current, first_previous = current_states[0]
+    rollback_snapshots = [
+        {
+            "file_path": str(target),
+            "previous_code": current,
+            "new_code": previous,
+            "before_hash": _compute_hash(current),
+            "after_hash": _compute_hash(previous),
+        }
+        for target, current, previous in current_states
+    ]
+    try:
+        conn.execute(
+            "UPDATE ledger SET status = ? WHERE id = ?",
+            (LedgerStatus.ROLLED_BACK.value, entry_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO ledger (
+                timestamp, file_path, previous_code, new_code, severity, changed_by,
+                details, issue_id, validation_result, status, rollback_ref, before_hash, after_hash, file_changes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                str(first_target),
+                first_current,
+                first_previous,
+                row["severity"],
+                ChangedBy.USER.value,
+                f"Rollback of combined change #{entry_id} ({len(rollback_snapshots)} files)",
+                row["issue_id"],
+                "PASSED",
+                LedgerStatus.ACTIVE.value,
+                entry_id,
+                _compute_hash(first_current),
+                _compute_hash(first_previous),
+                json.dumps(rollback_snapshots),
+            ),
+        )
+        updated = conn.execute("SELECT * FROM ledger WHERE id = ?", (entry_id,)).fetchone()
+    except Exception:
+        for target, current, _previous in current_states:
+            _atomic_write(target, current)
+        raise
+    return _row_to_entry(updated)
+
+
 def list_logs(db_path: Optional[Path] = None) -> list[LedgerEntry]:
     """Retrieve all change logs ordered from newest to oldest."""
     with _connect(db_path) as conn:
@@ -392,6 +550,10 @@ def get_entry(entry_id: int, db_path: Optional[Path] = None) -> LedgerEntry | No
 
 def _row_to_entry(row: sqlite3.Row | dict[str, Any]) -> LedgerEntry:
     data = dict(row)
+    if data.get("file_changes"):
+        data["file_changes"] = json.loads(data["file_changes"])
+    else:
+        data["file_changes"] = None
     return LedgerEntry.model_validate(data)
 
 

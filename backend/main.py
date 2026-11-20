@@ -103,6 +103,7 @@ class LedgerLogRequest(BaseModel):
     issue_id: Optional[str] = None
     validation_result: Optional[str] = None
     record_only: bool = False
+    file_changes: Optional[List[dict[str, str]]] = None
 
 class RollbackRequest(BaseModel):
     id: int
@@ -297,8 +298,11 @@ def log_ledger_change(request: LedgerLogRequest):
             workspace_root=request.workspace_root,
             write_to_disk=not request.record_only,
             record_only=request.record_only,
+            file_changes=request.file_changes,
         )
         return entry.model_dump()
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

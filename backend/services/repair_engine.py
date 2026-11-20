@@ -180,25 +180,50 @@ def _apply_workspace_rename(
             explanation="The multi-file function rename failed validation and all changed files were restored.",
         )
 
-    first_change_id: Optional[int] = None
-    for path, code in changes.items():
+    # Validation ran against the proposed multi-file result. Restore the
+    # original snapshot, then let the ledger atomically write and record the
+    # complete rename as one rollbackable change.
+    try:
+        for path in reversed(written):
+            _atomic_write(path, originals[path])
+
         entry = ledger.insert_log(
-            file_path=str(path),
-            previous_code=originals[path],
-            new_code=code,
+            file_path=str(primary_path.relative_to(root)),
+            previous_code=originals[primary_path],
+            new_code=changes[primary_path],
             severity=severity,
             changed_by=ledger.ChangedBy.AI,
             details=(
                 f"Issue: {issue_title or issue_id}. {issue_description or ''} "
-                f"Renamed function `{old_name}` to `{new_name}` across the workspace."
+                f"Renamed function `{old_name}` to `{new_name}` across {len(changes)} file(s)."
             ).strip(),
             issue_id=issue_id,
             validation_result="PASSED",
             status=ledger.LedgerStatus.ACTIVE,
             workspace_root=str(root),
+            write_to_disk=True,
+            file_changes=[
+                {
+                    "file_path": str(path.relative_to(root)),
+                    "new_code": code,
+                    "expected_code": originals[path],
+                }
+                for path, code in changes.items()
+            ],
         )
-        if first_change_id is None:
-            first_change_id = entry.id
+    except Exception as exc:
+        # The ledger's combined write restores the original snapshots if the
+        # write or audit insert fails, so the failed rename remains unapplied.
+        return RepairApplyResult(
+            success=False,
+            issue_id=issue_id,
+            file_path=str(primary_path.relative_to(root)),
+            severity=severity,
+            validation_status="FAILED",
+            output_logs=str(exc),
+            rollback_status="RESTORED",
+            explanation="The validated rename could not be saved to the combined rollback ledger; all original files were restored.",
+        )
 
     return RepairApplyResult(
         success=True,
@@ -209,7 +234,7 @@ def _apply_workspace_rename(
         output_logs=validation.output_log,
         rollback_status="NOT_NEEDED",
         explanation=f"Renamed `{old_name}` to `{new_name}` in {len(changes)} Python file(s).",
-        change_id=first_change_id,
+        change_id=entry.id,
         details=validation.details,
         updated_files={str(path.relative_to(root)): code for path, code in changes.items()},
     )
